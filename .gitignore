@@ -1,0 +1,74 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Môi trường ảo ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# ── Jupyter / Colab ───────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Dữ liệu (KHÔNG đưa lên GitHub — quá lớn) ─────────────────
+data/raw/
+data/processed/
+data/final/
+data/raw/checkpoints/
+data/raw/checkpoints_gee/
+
+# Cho phép commit các file mẫu nhỏ (demo/test)
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/final/.gitkeep
+
+# ── Mô hình đã huấn luyện (quá lớn) ──────────────────────────
+models/*.keras
+models/*.h5
+models/*.pkl
+models/*.pt
+# Cho phép commit file README mô hình
+!models/.gitkeep
+
+# ── Kết quả / Biểu đồ ─────────────────────────────────────────
+results/*.png
+results/*.csv
+results/*.json
+!results/.gitkeep
+
+# ── TensorFlow / Keras cache ──────────────────────────────────
+*.tfevents.*
+logs/
+tensorboard/
+
+# ── Google Earth Engine / GEE ─────────────────────────────────
+gee_task_ids.json
+.earthengine/
+
+# ── IDE / Editor ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Secrets & API keys (TUYỆT ĐỐI không commit) ──────────────
+.env
+*.env.*
+secrets.json
+credentials.json
+token.json
+service_account*.json
