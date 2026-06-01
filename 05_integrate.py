@@ -1,32 +1,43 @@
 """
-Bước 5: Tích hợp bộ dữ liệu hoàn chỉnh
-=========================================
-Luồng xử lý:
-  (a) Load dữ liệu từ NASA POWER, GEE Sentinel-2, Báo chí
-  (b) Nội suy tuyến tính + Kalman Filter → chuỗi mực nước giờ đầy đủ
-  (c) Suy luận số cửa xả (infer_cua_xa) + phát hiện xả bất thường
-  (d) Xây dựng feature engineering (lag, rolling, temporal encoding)
-  (e) Suy luận Q_out từ phương trình cân bằng nước (gộp từ Bước 7)
-      → Đây là điểm cải tiến so với phiên bản trước:
-         Q_out được tính ngay tại bước 5, TRƯỚC khi chia train/val/test,
-         đảm bảo rolling window không bị đứt giữa các tập dữ liệu.
-  (f) Chia tập train / val / test theo thời gian (không xáo trộn)
-  (g) Min-Max normalization — scaler chỉ fit trên tập train (anti data-leakage)
-  (h) Lưu ra 4 file CSV cho bước huấn luyện mô hình Bi-LSTM
+Bước 5: Tích hợp bộ dữ liệu ngày (Daily) cho BiLSTM — Hồ Núi Cốc
+=====================================================================
+Phiên bản: 3.0 — Daily pipeline (thay thế hourly v2.0)
 
-Phiên bản: 2.0 — Tích hợp Q_out features
+LÝ DO CHUYỂN SANG DAILY:
+  Dữ liệu GEE Sentinel-2 chỉ có ~80 điểm thực (sau làm sạch) giai đoạn
+  2019-2025. Xây dựng chuỗi giờ từ 80 điểm -> ~80% là nội suy -> không
+  đáng tin cậy để train BiLSTM. Giải pháp: dùng tần số NGÀY + augmentation
+  thủy văn để đạt >= 300 điểm training.
+
+LUỒNG XỬ LÝ:
+  (a) Làm sạch GEE Sentinel-2 (loại fallback 36m, outlier >3500ha, dedup)
+  (b) Augmentation dữ liệu thủy văn tổng hợp (2017-2019 + lấp gap)
+  (c) NASA POWER aggregate ngày (sum rain, mean temp/humidity)
+  (d) Merge và PCHIP interpolation (gap <= 60 ngày)
+  (e) Feature engineering ngày (lag 1/3/7/14/30, rolling 7/30, seasonal)
+  (f) Q_out daily estimation từ phương trình cân bằng nước
+  (g) Chia train/val/test theo thời gian (không shuffle)
+  (h) Min-Max normalization (fit chỉ trên train)
+  (i) Lưu 4 file CSV cho bước huấn luyện BiLSTM
+
+Phân chia thời gian:
+  Train : 2017-01 -> 2022-12  (bao gồm augmented data)
+  Val   : 2023-01 -> 2023-12
+  Test  : 2024-01 -> 2025-12  (bao gồm lũ Yagi 9/2024)
 """
 
 import os
 import sys
-import time
 import logging
+import warnings
 import joblib
 
 import numpy as np
 import pandas as pd
+from scipy.interpolate import interp1d, PchipInterpolator
 from scipy.ndimage import gaussian_filter1d
-from importlib import util as _iutil
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Cấu hình logging chuẩn
 logging.basicConfig(
@@ -36,362 +47,550 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# DYNAMIC IMPORT — load module từ file .py cùng thư mục
-# (tránh phụ thuộc vào cấu trúc package)
-# ============================================================
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 
 
-def _load_module(module_name: str, filename: str):
-    """Import động một file .py theo đường dẫn tuyệt đối."""
-    filepath = os.path.join(_THIS_DIR, filename)
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(
-            f"Không tìm thấy '{filename}' tại: {_THIS_DIR}\n"
-            "Hãy đảm bảo tất cả các file .py nằm cùng thư mục."
-        )
-    spec = _iutil.spec_from_file_location(module_name, filepath)
-    mod = _iutil.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# Import từ Bước 3-4: cửa xả & báo chí
-_cua_xa_mod = _load_module("cua_xa_bao_chi", "03_04_cua_xa_bao_chi.py")
-infer_cua_xa = _cua_xa_mod.infer_cua_xa
-detect_abnormal_release = _cua_xa_mod.detect_abnormal_release
-load_bao_chi_data = _cua_xa_mod.load_bao_chi_data
-
-# Import từ Bước 7: suy luận Q_out
-# Gộp vào bước 5 để đảm bảo pipeline liên tục, không đứt gãy giữa các bước
-_qout_mod = _load_module("infer_qout", "07_infer_qout_1.py")
-infer_qout = _qout_mod.infer_qout
-detect_sudden_release = _qout_mod.detect_sudden_release
-add_qout_features = _qout_mod.add_qout_features
-
-
 # ============================================================
-# CẤU HÌNH ĐƯỜNG DẪN & PHÂN CHIA DỮ LIỆU
+# CẤU HÌNH
 # ============================================================
 OUTPUT_TRAIN = "data/final/dataset_train.csv"
 OUTPUT_VAL   = "data/final/dataset_val.csv"
 OUTPUT_TEST  = "data/final/dataset_test.csv"
-OUTPUT_FULL  = "data/final/dataset_full.csv"  # Dữ liệu thô (chưa normalize)
+OUTPUT_FULL  = "data/final/dataset_full.csv"
 
-# Mốc thời gian phân chia — tuân thủ nguyên tắc không xáo trộn (no shuffle)
-# Train: 2020–2023 | Val: 2024-01 → 2024-08 | Test: 2024-09+ (lũ Yagi)
-TRAIN_END = "2023-06-30"
-VAL_END   = "2024-08-31"
+# Phân chia thời gian theo giai đoạn thủy văn
+TRAIN_END = "2022-12-31"
+VAL_END   = "2023-12-31"
+# Test: 2024-01-01 -> hết (bao gồm lũ Yagi tháng 9/2024)
 
-FORECAST_HORIZONS = [1, 3, 6, 12, 24]  # Các khoảng dự báo (giờ)
+# Thông số augmentation
+AUG_START           = "2017-01-01"  # Bắt đầu từ khi Sentinel-2A phóng
+AUG_END_EXCLUSIVE   = "2019-04-01"  # Điểm GEE đầu tiên thực sự
+MAX_INTERP_GAP_DAYS = 60            # Không nội suy quá 60 ngày liên tục
 
-# ============================================================
-# FEATURE COLUMNS — 18 đặc trưng đầu vào cho Bi-LSTM
-# ============================================================
-# Nhóm 1: Khí tượng (5 features)
-# Nhóm 2: Lag mực nước — bắt được "trí nhớ" ngắn hạn (5 features)
-# Nhóm 3: Cửa xả — hành vi vận hành hồ chứa (2 features)
-# Nhóm 4: Q_out — lưu lượng xả suy luận (6 features, MỚI trong v2.0)
+# Feature columns cho BiLSTM daily
 FEATURE_COLS = [
-    # --- Khí tượng ---
-    "rain_1h", "rain_6h", "rain_24h",
-    "temperature", "humidity",
-    # --- Lag mực nước ---
-    "water_level_lag1", "water_level_lag2", "water_level_lag3",
-    "water_level_lag6", "water_level_lag12",
-    # --- Cửa xả ---
-    "so_cua_xa", "dang_xa_cua",
-    # --- Q_out (lưu lượng xả suy luận) ---
-    "Q_out_smooth",   # Lưu lượng xả đã làm mịn (m³/s)
-    "Q_out_lag1",     # Q_out 1 giờ trước
-    "Q_out_lag6",     # Q_out 6 giờ trước (xu hướng ngắn hạn)
-    "Q_out_roll24",   # Trung bình Q_out 24 giờ (xu hướng ngày)
-    "dQout_dt",       # Tốc độ thay đổi Q_out (gia tốc xả)
-    "xa_dot_ngot",    # Flag xả đột ngột (0/1)
+    # --- Khí tượng ngày ---
+    "rain_1d",           # Lượng mưa ngày (mm)
+    "rain_3d",           # Mưa tích lũy 3 ngày
+    "rain_7d",           # Mưa tích lũy 7 ngày
+    "rain_14d",          # Mưa tích lũy 14 ngày
+    "temperature",       # Nhiệt độ trung bình ngày (°C)
+    "humidity",          # Độ ẩm trung bình ngày (%)
+    # --- Lag mực nước ngày ---
+    "water_level_lag1",  # Mực nước ngày hôm qua
+    "water_level_lag3",  # 3 ngày trước
+    "water_level_lag7",  # 7 ngày trước (xu hướng tuần)
+    "water_level_lag14", # 14 ngày trước
+    "water_level_lag30", # 30 ngày trước (xu hướng tháng)
+    # --- Rolling statistics ---
+    "water_level_roll7",  # Trung bình mực nước 7 ngày
+    "water_level_roll30", # Trung bình mực nước 30 ngày
+    "water_level_std7",   # Độ lệch chuẩn mực nước 7 ngày (biến động)
+    # --- Temporal encoding ---
+    "month_sin",          # Mã hóa tuần hoàn tháng (sin)
+    "month_cos",          # Mã hóa tuần hoàn tháng (cos)
+    "season_wet",         # Mùa mưa (tháng 5-10)
+    "season_dry",         # Mùa khô (tháng 11-4)
+    # --- Q_out daily ---
+    "dH_dt_daily",        # Tốc độ thay đổi mực nước (m/ngày)
+    "Q_out_daily",        # Lưu lượng xả ước tính ngày (m3/s)
+    "Q_out_roll7",        # Trung bình xả 7 ngày
 ]
 
-TARGET_COL = "water_level_m"
+TARGET_COL    = "water_level_m"
+FORECAST_DAYS = [1, 3, 7, 14, 30]  # Dự báo 1/3/7/14/30 ngày
+
+# Đường cong A-H (giống 02_gee_colab.py) — dùng cho Q_out daily
+AH_CURVE = [
+    (  50, 34.00), (150, 35.50), (200, 36.00),
+    ( 500, 38.00), (900, 40.00), (1400, 42.00),
+    (2000, 44.00), (2500, 46.20), (2700, 46.50),
+    (2900, 46.90), (3050, 47.20), (3150, 47.50),
+    (3200, 47.80), (3500, 48.25),
+]
+_ah_levels = [p[1] for p in AH_CURVE]
+_ah_areas  = [p[0] * 1e4 for p in AH_CURVE]   # ha -> m2
+_level_to_area = interp1d(
+    _ah_levels, _ah_areas, kind="linear",
+    bounds_error=False,
+    fill_value=(_ah_areas[0], _ah_areas[-1])
+)
 
 
 # ============================================================
-# HÀM LOAD NASA CSV AN TOÀN
+# 5a: LÀM SẠCH GEE SENTINEL-2
 # ============================================================
-def load_nasa_csv(path: str) -> pd.DataFrame:
+def clean_gee_data(df_gee: pd.DataFrame) -> pd.DataFrame:
     """
-    Đọc file NASA POWER CSV với xử lý linh hoạt tên cột timestamp.
+    Làm sạch chuyên sâu dữ liệu GEE Sentinel-2.
 
-    Vấn đề gốc:
-        01_nasa_power.py lưu bằng df.to_csv() sau khi set_index("timestamp"),
-        nên cột đầu tiên là index (không có header tên "timestamp").
-        → parse_dates=["timestamp"] sẽ báo lỗi KeyError.
-
-    Giải pháp:
-        Tự động phát hiện tên cột timestamp và đọc đúng cách.
+    Xử lý cả hai trường hợp:
+      - File GEE mới (postprocess() v3.0): không còn fallback 36m
+      - File GEE cũ (postprocess() cũ): vẫn có fallback 36.0m -> sẽ lọc ở đây
 
     Parameters
     ----------
-    path : str
-        Đường dẫn đến file CSV.
+    df_gee : pd.DataFrame
+        DataFrame từ gee_water_level.csv
 
     Returns
     -------
     pd.DataFrame
-        DataFrame với DatetimeIndex tên "timestamp".
+        Dataset đã làm sạch với DatetimeIndex ngày.
     """
-    # Đọc header để kiểm tra tên cột
-    header_df = pd.read_csv(path, nrows=0)
-    cols = header_df.columns.tolist()
+    logger.info("[5a] Làm sạch GEE Sentinel-2...")
+    df = df_gee.copy()
 
-    # Các tên cột timestamp phổ biến
-    time_candidates = ["timestamp", "datetime", "date", "time", "DATE", "DateTime"]
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df["water_area_ha"] = pd.to_numeric(df["water_area_ha"], errors="coerce")
+    df["water_level_m"] = pd.to_numeric(df["water_level_m"], errors="coerce")
+
+    # Đồng bộ tên cột mây: hỗ trợ cả file cũ (cloud_scene) và mới (cloud_cover)
+    if "cloud_scene" not in df.columns:
+        if "cloud_cover" in df.columns:
+            df["cloud_scene"] = pd.to_numeric(df["cloud_cover"], errors="coerce")
+        else:
+            logger.warning("  Không tìm thấy cột cloud_scene/cloud_cover — bỏ qua lọc mây.")
+            df["cloud_scene"] = 0.0
+    else:
+        df["cloud_scene"] = pd.to_numeric(df["cloud_scene"], errors="coerce")
+
+    n0 = len(df)
+    logger.info("  Ban đầu: %d bản ghi", n0)
+
+    # Bước 1: Loại outlier vật lý (diện tích ngoài phạm vi hồ Núi Cốc)
+    df = df[df["water_area_ha"].between(150, 3500)].copy()
+    logger.info(
+        "  Sau lọc vật lý (150-3500 ha): %d bản ghi (loại %d)",
+        len(df), n0 - len(df)
+    )
+
+    # Bước 2: Loại fallback 36.0m
+    # round(6) tránh bỏ nhầm giá trị gần 36m thực (ví dụ 36.001m)
+    n1 = len(df)
+    fallback_mask = (
+        df["water_level_m"].notna()
+        & (df["water_level_m"].round(6) == 36.0)
+    )
+    df = df[~fallback_mask].copy()
+    logger.info(
+        "  Sau loại fallback 36.0m: %d bản ghi (loại %d)",
+        len(df), n1 - len(df)
+    )
+
+    # Bước 3: Loại NaN mực nước
+    n2 = len(df)
+    df = df.dropna(subset=["water_level_m"])
+    logger.info(
+        "  Sau loại NaN: %d bản ghi (loại %d)", len(df), n2 - len(df)
+    )
+
+    # Bước 4: Deduplication theo ngày — giữ ảnh ít mây nhất
+    df = df.sort_values(["date", "cloud_scene"])
+    n3 = len(df)
+    df = df.drop_duplicates(subset="date", keep="first")
+    logger.info(
+        "  Sau dedup ngày: %d bản ghi (loại %d trùng)", len(df), n3 - len(df)
+    )
+
+    # Phân cấp chất lượng
+    df["quality"] = np.select(
+        [df["cloud_scene"] < 30, df["cloud_scene"] < 60, df["cloud_scene"] <= 80],
+        ["good", "fair", "low"],
+        default="low",
+    )
+
+    # Set index ngày
+    df = df.set_index("date").sort_index()
+    df.index = pd.to_datetime(df.index).normalize()
+
+    # Thống kê
+    logger.info("  === Kết quả làm sạch GEE ===")
+    logger.info("  Tổng hợp lệ: %d điểm quan trắc", len(df))
+    logger.info(
+        "  Giai đoạn  : %s -> %s",
+        df.index.min().date(), df.index.max().date()
+    )
+    for q in ["good", "fair", "low"]:
+        sub = df[df["quality"] == q]
+        if len(sub):
+            logger.info(
+                "  %s: %d điểm | mực nước %.2f-%.2fm",
+                q, len(sub),
+                sub["water_level_m"].min(), sub["water_level_m"].max()
+            )
+
+    return df[["water_area_ha", "water_level_m", "cloud_scene", "quality"]]
+
+
+# ============================================================
+# 5b: AUGMENTATION DỮ LIỆU THỦY VĂN TỔNG HỢP
+# ============================================================
+def synthesize_hydrological_data(
+    df_gee_clean: pd.DataFrame,
+    df_nasa_daily: pd.DataFrame,
+    aug_start: str = AUG_START,
+    aug_end: str = AUG_END_EXCLUSIVE,
+) -> pd.DataFrame:
+    """
+    Tổng hợp dữ liệu thủy văn cho giai đoạn thiếu data GEE (2017-2019).
+
+    Phương pháp: Học seasonal pattern từ dữ liệu thực (good+fair) theo
+    tháng, sau đó sinh dữ liệu với noise thực tế và làm mịn bằng
+    Gaussian filter để mô phỏng biến động mực nước tự nhiên.
+
+    Nguyên tắc thủy văn hồ Núi Cốc:
+      - Mùa mưa (tháng 5-10): mực nước 40-46m, xu hướng tăng
+      - Mùa khô (tháng 11-4): mực nước 36-42m, xu hướng giảm
+      - Đỉnh: tháng 9-10 | Đáy: tháng 3-4
+
+    Parameters
+    ----------
+    df_gee_clean : pd.DataFrame
+        Dữ liệu GEE đã làm sạch (DatetimeIndex ngày).
+    df_nasa_daily : pd.DataFrame
+        Dữ liệu NASA POWER theo ngày.
+    aug_start, aug_end : str
+        Phạm vi thời gian cần tổng hợp.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame với water_level_m tổng hợp và is_observed=False.
+    """
+    logger.info("[5b] Tổng hợp dữ liệu thủy văn 2017-2019...")
+
+    # Học seasonal pattern từ dữ liệu thực chất lượng cao
+    df_real = df_gee_clean[df_gee_clean["quality"].isin(["good", "fair"])].copy()
+    if len(df_real) < 20:
+        logger.warning(
+            "  Ít dữ liệu good/fair (%d điểm) -> dùng toàn bộ GEE clean.", len(df_real)
+        )
+        df_real = df_gee_clean.copy()
+
+    # Thống kê mực nước theo tháng
+    monthly_stats = (
+        df_real.groupby(df_real.index.month)["water_level_m"]
+        .agg(["mean", "std"])
+        .rename(columns={"mean": "mu", "std": "sigma"})
+    )
+
+    # Đảm bảo đủ 12 tháng bằng nội suy
+    all_months = pd.DataFrame(index=range(1, 13))
+    monthly_stats = all_months.join(monthly_stats).interpolate(method="index")
+    monthly_stats["sigma"] = monthly_stats["sigma"].fillna(0.5).clip(lower=0.3)
+
+    # Tạo index ngày cần tổng hợp
+    aug_idx = pd.date_range(start=aug_start, end=aug_end, freq="D")[:-1]
+
+    # Sinh mực nước từng ngày với seasonal pattern + noise giới hạn
+    np.random.seed(42)
+    synth_levels = []
+    for date in aug_idx:
+        month = date.month
+        mu    = monthly_stats.loc[month, "mu"]
+        sigma = monthly_stats.loc[month, "sigma"]
+
+        noise = np.random.normal(0, sigma * 0.4)
+        noise = np.clip(noise, -1.5 * sigma, 1.5 * sigma)
+        level = np.clip(mu + noise, 36.0, 48.25)
+        synth_levels.append(level)
+
+    # Gaussian smoothing: sigma=7 ngày -> mô phỏng quán tính thủy văn
+    synth_levels_arr = np.array(synth_levels)
+    synth_levels_smooth = gaussian_filter1d(synth_levels_arr, sigma=7)
+
+    df_synth = pd.DataFrame({
+        "water_level_m": synth_levels_smooth,
+        "is_observed":   False,
+        "quality":       "synthetic",
+    }, index=aug_idx)
+
+    logger.info(
+        "  Tổng hợp: %d điểm ngày (%s -> %s) | %.2f-%.2fm",
+        len(df_synth),
+        df_synth.index.min().date(),
+        df_synth.index.max().date(),
+        df_synth["water_level_m"].min(),
+        df_synth["water_level_m"].max(),
+    )
+
+    return df_synth[["water_level_m", "is_observed", "quality"]]
+
+
+# ============================================================
+# 5c: RESAMPLE VÀ INTERPOLATION
+# ============================================================
+def build_daily_water_level(
+    df_gee_clean: pd.DataFrame,
+    df_synth: pd.DataFrame,
+    max_gap_days: int = MAX_INTERP_GAP_DAYS,
+) -> pd.DataFrame:
+    """
+    Xây dựng chuỗi mực nước ngày đầy đủ từ GEE + dữ liệu tổng hợp.
+
+    Ưu tiên: GEE thực tế > synthetic > PCHIP interpolation
+    Gap > max_gap_days: để NaN (không nội suy sai)
+
+    Parameters
+    ----------
+    df_gee_clean : pd.DataFrame
+        Dữ liệu GEE đã làm sạch.
+    df_synth : pd.DataFrame
+        Dữ liệu tổng hợp 2017-2019.
+    max_gap_days : int
+        Khoảng cách tối đa cho phép nội suy (ngày).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame ngày với water_level_m và is_observed.
+    """
+    logger.info("[5c] Xây dựng chuỗi mực nước ngày liên tục...")
+
+    # GEE thực: is_observed = True
+    df_gee_merge = df_gee_clean[["water_level_m"]].copy()
+    df_gee_merge["is_observed"] = True
+
+    # Synthetic: chỉ lấy ngày chưa có GEE
+    df_synth_filt = df_synth[
+        ~df_synth.index.isin(df_gee_merge.index)
+    ][["water_level_m", "is_observed"]].copy()
+
+    # Ghép: GEE > synthetic
+    df_obs = pd.concat([df_gee_merge, df_synth_filt]).sort_index()
+    df_obs = df_obs[~df_obs.index.duplicated(keep="first")]
+
+    # Lưới ngày đầy đủ
+    full_idx = pd.date_range(
+        start=df_obs.index.min(),
+        end=df_obs.index.max(),
+        freq="D",
+    )
+    df_daily = pd.DataFrame(index=full_idx)
+    df_daily["water_level_m"] = df_obs["water_level_m"]
+    df_daily["is_observed"]   = df_obs["is_observed"].reindex(full_idx, fill_value=False)
+
+    # Đánh dấu gap lớn: không nội suy vào đó
+    obs_dates = df_obs.index
+
+    def _mark_large_gaps(series, obs_dates, max_gap):
+        """Giữ NaN cho vị trí nằm trong gap > max_gap ngày."""
+        result = series.copy()
+        nan_mask = series.isna()
+        for i, date in enumerate(series.index):
+            if not nan_mask.iloc[i]:
+                continue
+            before = obs_dates[obs_dates < date]
+            after  = obs_dates[obs_dates > date]
+            if len(before) == 0 or len(after) == 0:
+                continue   # biên -> sẽ NaN sau PCHIP extrapolate=False
+            gap_left  = (date - before[-1]).days
+            gap_right = (after[0]  - date).days
+            if min(gap_left, gap_right) > max_gap:
+                result.iloc[i] = np.nan
+        return result
+
+    df_daily["water_level_m"] = _mark_large_gaps(
+        df_daily["water_level_m"], obs_dates, max_gap_days
+    )
+
+    # PCHIP interpolation (bảo toàn đơn điệu cục bộ)
+    mask_valid = df_daily["water_level_m"].notna()
+    if mask_valid.sum() >= 4:
+        x_valid  = np.where(mask_valid)[0]
+        y_valid  = df_daily["water_level_m"].values[mask_valid]
+        pchip    = PchipInterpolator(x_valid, y_valid, extrapolate=False)
+        x_all    = np.arange(len(df_daily))
+        y_interp = pchip(x_all)
+
+        nan_pos = np.where(df_daily["water_level_m"].isna())[0]
+        if len(nan_pos):
+            df_daily.loc[df_daily.index[nan_pos], "water_level_m"] = y_interp[nan_pos]
+
+    df_daily["water_level_m"] = df_daily["water_level_m"].clip(34.0, 48.25)
+
+    n_obs   = int(df_daily["is_observed"].sum())
+    n_total = int(df_daily["water_level_m"].notna().sum())
+    n_nan   = int(df_daily["water_level_m"].isna().sum())
+    logger.info(
+        "  Lưới ngày: %d ngày | %d quan trắc thực | %d nội suy | %d gap NaN",
+        len(df_daily), n_obs, n_total - n_obs, n_nan
+    )
+
+    return df_daily
+
+
+# ============================================================
+# 5d: NASA POWER AGGREGATE NGÀY
+# ============================================================
+def aggregate_nasa_daily(path_nasa: str) -> pd.DataFrame:
+    """
+    Đọc NASA POWER hourly và aggregate về tần số ngày.
+
+    Aggregation:
+      rain    : sum  (tổng mưa ngày mm)
+      temp    : mean (nhiệt độ TB ngày °C)
+      humidity: mean (độ ẩm TB ngày %)
+
+    Parameters
+    ----------
+    path_nasa : str
+        Đường dẫn nasa_power_hourly.csv.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame ngày với rain_1d/3d/7d/14d, temperature, humidity.
+    """
+    logger.info("[5d] Aggregate NASA POWER -> ngày...")
+
+    header_df = pd.read_csv(path_nasa, nrows=0)
+    cols = header_df.columns.tolist()
+    time_candidates = ["timestamp", "datetime", "date", "time", "DATE"]
     time_col = next((c for c in time_candidates if c in cols), None)
 
     if time_col:
-        # Cột timestamp còn nằm trong header (không phải index)
-        df = pd.read_csv(path, parse_dates=[time_col], index_col=time_col)
+        df = pd.read_csv(path_nasa, parse_dates=[time_col], index_col=time_col)
     else:
-        # Cột đầu tiên là index (trường hợp phổ biến với 01_nasa_power.py)
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        df = pd.read_csv(path_nasa, index_col=0, parse_dates=True)
+    df.index.name = "timestamp"
 
-    df.index.name = "timestamp"  # Chuẩn hóa tên index
+    # Xác định cột mưa giờ
+    rain_col = next(
+        (c for c in ["rain_1h", "rain_hourly", "PRECTOTCORR"] if c in df.columns),
+        None
+    )
 
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError(
-            f"Không thể parse datetime từ file '{path}'.\n"
-            f"3 giá trị đầu của index: {df.index[:3].tolist()}"
-        )
+    # Aggregate
+    agg_dict = {}
+    if rain_col:
+        agg_dict["rain_1d"] = (rain_col, "sum")
+    if "temperature" in df.columns:
+        agg_dict["temperature"] = ("temperature", "mean")
+    if "humidity" in df.columns:
+        agg_dict["humidity"] = ("humidity", "mean")
+
+    df_daily = df.resample("D").agg(**agg_dict)
+
+    if "rain_1d" in df_daily.columns:
+        df_daily["rain_1d"]  = df_daily["rain_1d"].clip(lower=0)
+        df_daily["rain_3d"]  = df_daily["rain_1d"].rolling(3,  min_periods=1).sum()
+        df_daily["rain_7d"]  = df_daily["rain_1d"].rolling(7,  min_periods=1).sum()
+        df_daily["rain_14d"] = df_daily["rain_1d"].rolling(14, min_periods=1).sum()
+
+    df_daily.index = pd.to_datetime(df_daily.index).normalize()
 
     logger.info(
-        "load_nasa_csv: Đọc OK — %d bản ghi | %s → %s",
-        len(df), df.index.min(), df.index.max(),
+        "  NASA daily: %d ngày | %s -> %s",
+        len(df_daily),
+        df_daily.index.min().date(),
+        df_daily.index.max().date()
     )
-    return df
+    return df_daily
 
 
 # ============================================================
-# KALMAN FILTER 1D
+# 5e: FEATURE ENGINEERING NGÀY
 # ============================================================
-class SimpleKalmanFilter:
-    """
-    Kalman Filter một chiều dùng để làm mịn và điền khuyết chuỗi mực nước.
-
-    Phù hợp khi quan trắc thưa (Sentinel-2 ~5 ngày/lần) xen kẽ với
-    các điểm báo chí thưa hơn. Kalman filter dự đoán trạng thái ở các
-    giờ không có đo đạc và cập nhật ngay khi có quan trắc mới.
-
-    Tham số
-    -------
-    process_variance : float
-        Phương sai quá trình — điều khiển tốc độ thay đổi ước lượng.
-        Giá trị nhỏ → ước lượng thay đổi chậm (mượt hơn).
-    measurement_variance : float
-        Phương sai đo lường — phản ánh độ tin cậy của quan trắc.
-    """
-
-    def __init__(self, process_variance: float = 1e-4,
-                 measurement_variance: float = 0.01):
-        self.Q = process_variance
-        self.R = measurement_variance
-        self.P = 1.0   # Phương sai sai số ước lượng ban đầu
-        self.x = None  # Trạng thái ước lượng (mực nước)
-
-    def update(self, measurement=None) -> float:
-        """
-        Cập nhật một bước thời gian.
-
-        Parameters
-        ----------
-        measurement : float or None
-            Giá trị quan trắc tại bước này. None nếu không có đo đạc.
-
-        Returns
-        -------
-        float
-            Ước lượng mực nước sau khi cập nhật.
-        """
-        # Khởi tạo lần đầu
-        if self.x is None:
-            self.x = measurement if measurement is not None else 0.0
-            return self.x
-
-        # Bước dự đoán (predict step): tăng phương sai
-        self.P += self.Q
-
-        # Bước cập nhật (update step): chỉ khi có quan trắc
-        if measurement is not None:
-            K = self.P / (self.P + self.R)      # Kalman gain
-            self.x += K * (measurement - self.x)
-            self.P = (1 - K) * self.P
-
-        return self.x
-
-
-# ============================================================
-# NỘI SUY MỰC NƯỚC
-# ============================================================
-def interpolate_water_level(
-    df_nasa: pd.DataFrame,
-    df_gee: pd.DataFrame,
-    df_bao_chi: pd.DataFrame,
+def build_daily_features(
+    df_level: pd.DataFrame,
+    df_nasa_daily: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Tạo chuỗi mực nước liên tục theo giờ từ hai nguồn dữ liệu thưa:
-      - GEE Sentinel-2: ~5 ngày/lần, độ chính xác ±0.3m
-      - Báo chí: sự kiện quan trọng (lũ, xả lớn), độ chính xác ±0.1m
+    Xây dựng bộ đặc trưng ngày (21 features) cho BiLSTM.
 
-    Thuật toán:
-      1. Resample cả hai nguồn về tần số giờ
-      2. Ưu tiên báo chí khi có chồng chéo (chính xác hơn)
-      3. Nội suy tuyến tính theo thời gian để lấp khoảng trống
-      4. Áp dụng Kalman Filter 1D để làm mịn nhiễu đo lường
-
-    Parameters
-    ----------
-    df_nasa : pd.DataFrame
-        Dữ liệu NASA POWER với DatetimeIndex theo giờ (xác định phạm vi thời gian).
-    df_gee : pd.DataFrame
-        Dữ liệu GEE với cột 'date' và 'water_level_m'.
-    df_bao_chi : pd.DataFrame
-        Dữ liệu báo chí với cột 'timestamp' và 'water_level_bao_chi'.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame với DatetimeIndex theo giờ, cột 'water_level_m'.
-    """
-    # Tạo index giờ đầy đủ theo phạm vi NASA POWER
-    full_idx = pd.date_range(
-        start=df_nasa.index.min(),
-        end=df_nasa.index.max(),
-        freq="h",
-    )
-    df = pd.DataFrame(index=full_idx)
-
-    # Ghép dữ liệu GEE (resample về giờ)
-    gee_series = (
-        df_gee.set_index("date")["water_level_m"]
-        .resample("h").first()
-    )
-    df["level_gee"] = gee_series
-
-    # Ghép dữ liệu báo chí (resample về giờ)
-    bc_series = (
-        df_bao_chi.set_index("timestamp")["water_level_bao_chi"]
-        .resample("h").first()
-    )
-    df["level_bao_chi"] = bc_series
-
-    # Kết hợp: báo chí ưu tiên vì độ chính xác cao hơn
-    df["level_obs"] = df["level_bao_chi"].fillna(df["level_gee"])
-
-    # Nội suy tuyến tính theo trục thời gian (limit=None → lấp toàn bộ)
-    df["water_level_interp"] = df["level_obs"].interpolate(
-        method="time", limit=None
-    )
-
-    # Kalman Filter — làm mịn chuỗi nội suy
-    kf = SimpleKalmanFilter(process_variance=1e-4, measurement_variance=0.01)
-    level_kalman = [
-        kf.update(row["level_obs"] if pd.notna(row["level_obs"]) else None)
-        for _, row in df.iterrows()
-    ]
-    df["water_level_m"] = level_kalman
-
-    # Đánh giá sai số tại các điểm có quan trắc thực
-    mask_obs = df["level_obs"].notna()
-    if mask_obs.sum() > 0:
-        mae_interp = (
-            df.loc[mask_obs, "water_level_interp"]
-            - df.loc[mask_obs, "level_obs"]
-        ).abs().mean()
-        mae_kalman = (
-            df.loc[mask_obs, "water_level_m"]
-            - df.loc[mask_obs, "level_obs"]
-        ).abs().mean()
-        logger.info(
-            "Sai số tại %d điểm quan trắc: Nội suy=%.4fm | Kalman=%.4fm",
-            mask_obs.sum(), mae_interp, mae_kalman,
-        )
-
-    return df[["water_level_m"]].copy()
-
-
-# ============================================================
-# XÂY DỰNG FEATURES
-# ============================================================
-def build_features(df_level: pd.DataFrame,
-                   df_nasa: pd.DataFrame) -> pd.DataFrame:
-    """
-    Kết hợp mực nước + khí tượng + lag features + temporal encoding.
-
-    Các nhóm feature được xây dựng:
-      - Khí tượng (rain_1h/6h/24h, temperature, humidity): từ NASA POWER
-      - Lag mực nước (lag1/2/3/6/12): bắt "trí nhớ" ngắn-trung hạn
-      - Temporal encoding (sin/cos hour/month): bắt chu kỳ ngày/mùa
+    Nhóm features:
+      1. Khí tượng ngày : rain_1d/3d/7d/14d, temperature, humidity
+      2. Lag mực nước   : 1/3/7/14/30 ngày
+      3. Rolling stats  : mean 7/30 ngày, std 7 ngày
+      4. Temporal       : month_sin/cos, season_wet/dry
+      5. Q_out daily    : dH_dt_daily, Q_out_daily, Q_out_roll7
 
     Parameters
     ----------
     df_level : pd.DataFrame
-        DataFrame với cột 'water_level_m' và DatetimeIndex giờ.
-    df_nasa : pd.DataFrame
-        DataFrame với các cột khí tượng và DatetimeIndex giờ.
+        DataFrame với water_level_m (DatetimeIndex ngày).
+    df_nasa_daily : pd.DataFrame
+        NASA POWER theo ngày.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame đã bổ sung đầy đủ features.
+        DataFrame đầy đủ features.
     """
+    logger.info("[5e] Xây dựng features ngày...")
+
     df = df_level.copy()
 
-    # Ghép dữ liệu khí tượng
-    nasa_cols = ["rain_1h", "rain_6h", "rain_24h", "temperature", "humidity"]
+    # --- Ghép khí tượng ---
+    nasa_cols = ["rain_1d", "rain_3d", "rain_7d", "rain_14d",
+                 "temperature", "humidity"]
     for col in nasa_cols:
-        if col in df_nasa.columns:
-            df[col] = df_nasa[col]
+        if col in df_nasa_daily.columns:
+            df[col] = df_nasa_daily[col].reindex(df.index)
 
-    # Lag mực nước — bắt trạng thái trước đó
-    for lag in [1, 2, 3, 6, 12]:
+    # --- Lag mực nước ---
+    for lag in [1, 3, 7, 14, 30]:
         df[f"water_level_lag{lag}"] = df["water_level_m"].shift(lag)
 
-    # Temporal encoding (biến đổi sin/cos để mô hình hiểu tính tuần hoàn)
-    df["hour_sin"]  = np.sin(2 * np.pi * df.index.hour  / 24)
-    df["hour_cos"]  = np.cos(2 * np.pi * df.index.hour  / 24)
-    df["month_sin"] = np.sin(2 * np.pi * df.index.month / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df.index.month / 12)
+    # --- Rolling statistics ---
+    df["water_level_roll7"]  = df["water_level_m"].rolling(7,  min_periods=3).mean()
+    df["water_level_roll30"] = df["water_level_m"].rolling(30, min_periods=7).mean()
+    df["water_level_std7"]   = df["water_level_m"].rolling(7,  min_periods=3).std()
 
-    return df
+    # --- Temporal encoding (tuần hoàn) ---
+    df["month_sin"]  = np.sin(2 * np.pi * df.index.month / 12)
+    df["month_cos"]  = np.cos(2 * np.pi * df.index.month / 12)
+    df["season_wet"] = df.index.month.isin([5, 6, 7, 8, 9, 10]).astype(int)
+    df["season_dry"] = df.index.month.isin([11, 12, 1, 2, 3, 4]).astype(int)
 
+    # --- Q_out daily (phương trình cân bằng nước) ---
+    # dH/dt (m/ngày)
+    df["dH_dt_daily"] = df["water_level_m"].diff(1)
 
-def add_forecast_targets(df: pd.DataFrame,
-                          horizons: list = FORECAST_HORIZONS) -> pd.DataFrame:
-    """
-    Tạo cột target cho từng khoảng thời gian dự báo.
+    # Diện tích mặt hồ tại mực nước H (m2)
+    df["_area_m2"] = df["water_level_m"].apply(
+        lambda h: float(_level_to_area(h)) if pd.notna(h) else np.nan
+    )
 
-    Mực nước tại t+h được lấy bằng shift(-h) so với thời điểm hiện tại.
-    Các hàng cuối sẽ bị NaN và sẽ được loại bỏ sau bước này.
+    # Q_out = -A(H) * dH/dt / 86400  [m3/s]
+    # Dấu âm: mực nước giảm (dH < 0) -> đang xả ra ngoài
+    df["Q_out_daily"] = -(df["_area_m2"] * df["dH_dt_daily"]) / 86400.0
+    df["Q_out_daily"] = df["Q_out_daily"].clip(lower=0)
+    df["Q_out_roll7"] = df["Q_out_daily"].rolling(7, min_periods=1).mean()
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame đã có cột 'water_level_m'.
-    horizons : list of int
-        Danh sách khoảng dự báo tính bằng giờ.
+    df.drop(columns=["_area_m2"], inplace=True)
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame bổ sung các cột 'target_t{h}h'.
-    """
-    for h in horizons:
-        df[f"target_t{h}h"] = df["water_level_m"].shift(-h)
+    logger.info(
+        "  Features: %d cột x %d ngày | mực nước %.2f-%.2fm",
+        len(df.columns), len(df),
+        df["water_level_m"].min(), df["water_level_m"].max()
+    )
+
     return df
 
 
 # ============================================================
-# CHUẨN HÓA — ANTI DATA LEAKAGE
+# 5f: TẠO CỘT TARGET
+# ============================================================
+def add_forecast_targets(
+    df: pd.DataFrame,
+    horizons: list = None,
+) -> pd.DataFrame:
+    """Tạo cột target cho từng khoảng dự báo ngày (shift(-d))."""
+    if horizons is None:
+        horizons = FORECAST_DAYS
+    for d in horizons:
+        df[f"target_t{d}d"] = df["water_level_m"].shift(-d)
+    return df
+
+
+# ============================================================
+# 5g: CHUẨN HÓA — ANTI DATA LEAKAGE
 # ============================================================
 def normalize_features(
     df_train: pd.DataFrame,
@@ -400,40 +599,30 @@ def normalize_features(
     feature_cols: list,
 ):
     """
-    Min-Max normalization — scaler chỉ fit trên tập train.
-
-    Nguyên tắc anti data-leakage:
-        scaler.fit()       → chỉ trên df_train
-        scaler.transform() → áp dụng lên cả val và test
-    → Mô hình không "nhìn thấy" thống kê của tập val/test trong quá trình
-      chuẩn hóa, đảm bảo đánh giá khách quan.
-
-    Parameters
-    ----------
-    df_train, df_val, df_test : pd.DataFrame
-        Các tập dữ liệu đã chia theo thời gian.
-    feature_cols : list of str
-        Danh sách tên cột cần chuẩn hóa.
-
-    Returns
-    -------
-    tuple
-        (df_train_norm, df_val_norm, df_test_norm, scaler)
+    Min-Max normalization — scaler fit ONLY trên train.
+    Anti data-leakage: val/test thống kê không ảnh hưởng training.
     """
     from sklearn.preprocessing import MinMaxScaler
 
     scaler = MinMaxScaler()
+    df_train = df_train.copy()
+    df_val   = df_val.copy()
+    df_test  = df_test.copy()
 
-    # Fit chỉ trên train — transform trên cả 3 tập
-    df_train[feature_cols] = scaler.fit_transform(df_train[feature_cols])
-    df_val[feature_cols]   = scaler.transform(df_val[feature_cols])
-    df_test[feature_cols]  = scaler.transform(df_test[feature_cols])
+    cols_present = [c for c in feature_cols if c in df_train.columns]
+    missing      = [c for c in feature_cols if c not in df_train.columns]
+    if missing:
+        logger.warning("  Thiếu %d feature cols: %s", len(missing), missing)
+
+    df_train[cols_present] = scaler.fit_transform(df_train[cols_present])
+    df_val[cols_present]   = scaler.transform(df_val[cols_present])
+    df_test[cols_present]  = scaler.transform(df_test[cols_present])
 
     os.makedirs("models", exist_ok=True)
-    joblib.dump(scaler, "models/feature_scaler.pkl")
-    logger.info("Đã lưu scaler: models/feature_scaler.pkl")
+    joblib.dump(scaler, "models/feature_scaler_daily.pkl")
+    logger.info("  Đã lưu scaler: models/feature_scaler_daily.pkl")
 
-    return df_train, df_val, df_test, scaler
+    return df_train, df_val, df_test, scaler, cols_present
 
 
 # ============================================================
@@ -442,118 +631,129 @@ def normalize_features(
 def main():
     os.makedirs("data/final", exist_ok=True)
 
-    logger.info("=" * 60)
-    logger.info("BƯỚC 5: TÍCH HỢP BỘ DỮ LIỆU (v2.0 — tích hợp Q_out)")
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info("BUOC 5 (v3.0): PIPELINE NGAY -- Ho Nui Coc BiLSTM")
+    logger.info("=" * 65)
 
-    # ── 5a: Load dữ liệu đầu vào ──────────────────────────────
-    logger.info("[5a] Đọc dữ liệu từ các nguồn...")
-    df_nasa    = load_nasa_csv("data/raw/nasa_power_hourly.csv")
-    df_gee     = pd.read_csv("data/raw/gee_water_level.csv",
-                             parse_dates=["date"])
-    df_bao_chi = load_bao_chi_data()
+    # -- 5a: Load và làm sạch GEE --
+    logger.info("\n[Load] Doc du lieu GEE Sentinel-2...")
+    df_gee_raw = pd.read_csv(
+        "data/raw/gee_water_level.csv",
+        parse_dates=["date"],
+    )
+    logger.info("  GEE raw: %d ban ghi", len(df_gee_raw))
+    df_gee = clean_gee_data(df_gee_raw)
 
-    logger.info("  NASA POWER     : %d bản ghi", len(df_nasa))
-    logger.info("  GEE Sentinel-2 : %d quan trắc", len(df_gee))
-    logger.info("  Báo chí        : %d điểm", len(df_bao_chi))
+    # -- 5d: NASA POWER aggregate ngày --
+    logger.info("\n[Load] Aggregate NASA POWER -> ngay...")
+    df_nasa_daily = aggregate_nasa_daily("data/raw/nasa_power_hourly.csv")
 
-    # ── 5b: Nội suy mực nước + Kalman Filter ──────────────────
-    logger.info("[5b] Nội suy mực nước giờ...")
-    df_level = interpolate_water_level(df_nasa, df_gee, df_bao_chi)
+    # -- 5b: Augmentation 2017-2019 --
+    logger.info("\n[Augment] Tong hop du lieu 2017-2019...")
+    df_synth = synthesize_hydrological_data(df_gee, df_nasa_daily)
 
-    # ── 5c: Cửa xả ────────────────────────────────────────────
-    logger.info("[5c] Suy luận trạng thái cửa xả...")
-    df_level = infer_cua_xa(df_level, df_bao_chi)
-    df_level = detect_abnormal_release(df_level, rain_col="rain_6h")
+    # -- 5c: Xây dựng chuỗi ngày đầy đủ --
+    logger.info("\n[Resample] Xay dung chuoi muc nuoc ngay...")
+    df_daily_level = build_daily_water_level(df_gee, df_synth)
 
-    # ── 5d: Feature engineering ───────────────────────────────
-    logger.info("[5d] Xây dựng features khí tượng + lag...")
-    df = build_features(df_level, df_nasa)
+    # -- 5e: Feature engineering --
+    logger.info("\n[Features] Xay dung features ngay...")
+    df = build_daily_features(df_daily_level, df_nasa_daily)
 
-    # ── 5e: Suy luận Q_out (tích hợp từ Bước 7) ───────────────
-    # QUAN TRỌNG: Tính Q_out trên toàn bộ chuỗi TRƯỚC khi chia split,
-    # đảm bảo rolling window 24h không bị đứt giữa train và val.
-    logger.info("[5e] Suy luận Q_out từ phương trình cân bằng nước...")
-    df = infer_qout(df)
-    df = detect_sudden_release(df)
-    df = add_qout_features(df)
-
-    # Lưu dataset_full.csv (dữ liệu thô, chưa normalize) — dùng cho phân tích
+    # Lưu dataset_full (trước normalize, để phân tích)
     df.to_csv(OUTPUT_FULL)
-    logger.info("Đã lưu dataset_full.csv: %d bản ghi × %d cột",
-                len(df), len(df.columns))
+    logger.info(
+        "Da luu dataset_full.csv: %d ban ghi x %d cot",
+        len(df), len(df.columns)
+    )
 
-    # ── 5f: Thêm targets dự báo ────────────────────────────────
-    logger.info("[5f] Tạo cột target t+1/3/6/12/24h...")
+    # -- 5f: Thêm targets --
+    logger.info("\n[Target] Tao cot du bao t+1/3/7/14/30 ngay...")
     df = add_forecast_targets(df)
 
-    # Loại bỏ hàng đầu/cuối do lag và forecast horizon
-    # max_lag=24 vì Q_out_roll24 cần 24 bước khởi động
-    max_lag     = 24
-    max_horizon = max(FORECAST_HORIZONS)  # 24 giờ
+    # Cắt hàng đầu/cuối do lag và forecast horizon
+    max_lag     = 30  # water_level_lag30
+    max_horizon = 30  # target_t30d
     df = df.iloc[max_lag:-max_horizon].copy()
 
-    # Loại bỏ hàng còn NaN trong features hoặc targets
-    required_cols = FEATURE_COLS + [f"target_t{h}h" for h in FORECAST_HORIZONS]
-    df = df.dropna(subset=required_cols)
+    # Loại hàng NaN trong features/targets
+    target_cols   = [f"target_t{d}d" for d in FORECAST_DAYS]
+    required_cols = FEATURE_COLS + target_cols
+    avail_cols    = [c for c in required_cols if c in df.columns]
+    df = df.dropna(subset=avail_cols)
 
     logger.info(
-        "[5f] Bộ dữ liệu sau làm sạch: %d bản ghi × %d cột",
-        len(df), len(df.columns),
+        "\n[Dataset] Sau lam sach cuoi: %d ban ghi x %d cot",
+        len(df), len(df.columns)
     )
-    logger.info("  Từ: %s → Đến: %s", df.index.min(), df.index.max())
+    logger.info(
+        "  Giai doan: %s -> %s",
+        df.index.min().date(), df.index.max().date()
+    )
 
-    # ── 5g: Chia train / val / test ───────────────────────────
-    # Chia theo thời gian, KHÔNG xáo trộn (no shuffle) để tránh data leakage
+    # -- Chia train/val/test --
     df_train = df[df.index <= TRAIN_END].copy()
     df_val   = df[(df.index > TRAIN_END) & (df.index <= VAL_END)].copy()
     df_test  = df[df.index > VAL_END].copy()
 
-    logger.info("[5g] Chia dữ liệu:")
+    logger.info("\n[Split] Chia du lieu:")
     logger.info(
-        "  Train : %d bản ghi (%s → %s)",
-        len(df_train), df_train.index.min().date(), df_train.index.max().date(),
+        "  Train : %d ngay (%s -> %s)",
+        len(df_train),
+        df_train.index.min().date(), df_train.index.max().date()
     )
     logger.info(
-        "  Val   : %d bản ghi (%s → %s)",
-        len(df_val), df_val.index.min().date(), df_val.index.max().date(),
+        "  Val   : %d ngay (%s -> %s)",
+        len(df_val),
+        df_val.index.min().date(), df_val.index.max().date()
     )
     logger.info(
-        "  Test  : %d bản ghi (%s → %s) ← Lũ Yagi 2024",
-        len(df_test), df_test.index.min().date(), df_test.index.max().date(),
+        "  Test  : %d ngay (%s -> %s) <- bao gom lu Yagi 2024",
+        len(df_test),
+        df_test.index.min().date(), df_test.index.max().date()
     )
 
-    # ── 5h: Chuẩn hóa ─────────────────────────────────────────
-    logger.info("[5h] Chuẩn hóa Min-Max (fit only on train)...")
-    df_train, df_val, df_test, _ = normalize_features(
+    # Cảnh báo dataset nhỏ
+    if len(df_train) < 200:
+        logger.warning(
+            "CANH BAO: Train chi co %d ngay (nen >= 200 de BiLSTM on dinh).",
+            len(df_train)
+        )
+    if len(df_val) < 50:
+        logger.warning("CANH BAO: Val chi co %d ngay (nen >= 50).", len(df_val))
+    if len(df_test) < 50:
+        logger.warning("CANH BAO: Test chi co %d ngay (nen >= 50).", len(df_test))
+
+    # -- Chuẩn hóa --
+    logger.info("\n[Normalize] Min-Max (fit only on train)...")
+    df_train, df_val, df_test, _, feature_cols_present = normalize_features(
         df_train, df_val, df_test, FEATURE_COLS
     )
 
-    # ── Lưu output ────────────────────────────────────────────
+    # -- Lưu --
     df_train.to_csv(OUTPUT_TRAIN)
     df_val.to_csv(OUTPUT_VAL)
     df_test.to_csv(OUTPUT_TEST)
 
-    logger.info("Đã lưu: %s", OUTPUT_TRAIN)
-    logger.info("Đã lưu: %s", OUTPUT_VAL)
-    logger.info("Đã lưu: %s", OUTPUT_TEST)
+    logger.info("\n[Luu] Da luu:")
+    logger.info("  %s (%d dong)", OUTPUT_TRAIN, len(df_train))
+    logger.info("  %s (%d dong)", OUTPUT_VAL,   len(df_val))
+    logger.info("  %s (%d dong)", OUTPUT_TEST,  len(df_test))
 
-    # Thống kê giai đoạn lũ Yagi
-    yagi = df_test["2024-09-08":"2024-09-15"]
-    if len(yagi) > 0:
-        logger.info(
-            "[Test — Lũ Yagi] %d giờ | Mực nước max: %.2f m | Giờ xả cửa: %d",
-            len(yagi),
-            yagi["water_level_m"].max(),
-            int(yagi["dang_xa_cua"].sum()),
-        )
-
-    # Tóm tắt bộ features
-    logger.info("\n[Tóm tắt] %d FEATURE_COLS được dùng:", len(FEATURE_COLS))
-    for i, col in enumerate(FEATURE_COLS, 1):
-        logger.info("  %2d. %s", i, col)
-
-    logger.info("\n✓ Bước 5 hoàn thành — Chạy tiếp: python 06_bilstm_model.py")
+    # Tóm tắt
+    logger.info("\n" + "=" * 65)
+    logger.info("TOM TAT BO DU LIEU NGAY:")
+    logger.info(
+        "  Tong: %d ngay | Train: %d | Val: %d | Test: %d",
+        len(df), len(df_train), len(df_val), len(df_test)
+    )
+    logger.info("  Features: %d cot", len(feature_cols_present))
+    logger.info("  Horizons: %s ngay", FORECAST_DAYS)
+    if "is_observed" in df.columns:
+        obs_pct = int(df["is_observed"].mean() * 100)
+        logger.info("  Ty le diem thuc / tong: ~%d%%", obs_pct)
+    logger.info("=" * 65)
+    logger.info("\nBuoc 5 hoan thanh -- Chay tiep: python 06_bilstm_model.py")
 
 
 if __name__ == "__main__":
