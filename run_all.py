@@ -118,7 +118,7 @@ def main():
          "Bước 1: Thu thập dữ liệu khí tượng NASA POWER",
          False),
 
-        ("02_gee_sentinel2.py",
+        ("02_gee_sentinel2_v2.py",
          "Bước 2: Xử lý ảnh vệ tinh GEE Sentinel-2",
          False),
 
