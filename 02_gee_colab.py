@@ -34,8 +34,14 @@
 # Bỏ comment nếu cần cài thêm:
 # !pip install earthengine-api scipy --quiet
 
-from google.colab import drive
-drive.mount("/content/drive", force_remount=False)
+# ── PHÁT HIỆN MÔI TRƯỜNG CHẠY ────────────────────────────────
+# IS_COLAB = True  : đang chạy trong Google Colab → mount Drive, dùng GEE
+# IS_COLAB = False : đang mở trong IDE local (VS Code, PyCharm...) → skip
+try:
+    import google.colab  # noqa: F401
+    IS_COLAB = True
+except ImportError:
+    IS_COLAB = False
 
 import os, time, json
 import numpy as np
@@ -43,43 +49,65 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 
-# ── ĐƯỜNG DẪN — ĐỔI NẾU CẦN ──────────────────────────────────
-DRIVE_ROOT      = "/content/drive/MyDrive/DATN"
-DRIVE_DATA_DIR  = f"{DRIVE_ROOT}/data/raw"
-CHECKPOINT_DIR  = f"{DRIVE_ROOT}/data/raw/checkpoints_gee"
-OUTPUT_CSV      = f"{DRIVE_DATA_DIR}/gee_water_level.csv"
+if IS_COLAB:
+    from google.colab import drive
+    drive.mount("/content/drive", force_remount=False)
 
-# FIX LỖI CŨ: Tạo thư mục NGAY TẠI ĐÂY, không phụ thuộc vào Drive được
-# mount hoàn toàn hay chưa. Đảm bảo tồn tại trước mọi thao tác ghi file.
-for _d in [DRIVE_DATA_DIR, CHECKPOINT_DIR, f"{DRIVE_ROOT}/results"]:
-    os.makedirs(_d, exist_ok=True)
-    assert os.path.isdir(_d), f"KHÔNG thể tạo thư mục: {_d}"
+    # ── ĐƯỜNG DẪN COLAB (Google Drive) ───────────────────────
+    DRIVE_ROOT      = "/content/drive/MyDrive/DATN"
+    DRIVE_DATA_DIR  = f"{DRIVE_ROOT}/data/raw"
+    CHECKPOINT_DIR  = f"{DRIVE_ROOT}/data/raw/checkpoints_gee"
+    OUTPUT_CSV      = f"{DRIVE_DATA_DIR}/gee_water_level.csv"
 
-print("=" * 55)
-print("✓ Google Drive đã mount và thư mục đã tạo.")
-print(f"  Drive root    : {DRIVE_ROOT}")
-print(f"  Checkpoint    : {CHECKPOINT_DIR}")
-print(f"  Output CSV    : {OUTPUT_CSV}")
-print("=" * 55)
+    for _d in [DRIVE_DATA_DIR, CHECKPOINT_DIR, f"{DRIVE_ROOT}/results"]:
+        os.makedirs(_d, exist_ok=True)
+        assert os.path.isdir(_d), f"KHÔNG thể tạo thư mục: {_d}"
+
+    print("=" * 55)
+    print("✓ Google Drive đã mount và thư mục đã tạo.")
+    print(f"  Drive root    : {DRIVE_ROOT}")
+    print(f"  Checkpoint    : {CHECKPOINT_DIR}")
+    print(f"  Output CSV    : {OUTPUT_CSV}")
+    print("=" * 55)
+else:
+    # ── ĐƯỜNG DẪN LOCAL (chỉ để IDE không báo lỗi undefined) ─
+    # File này KHÔNG chạy được hoàn toàn trên local vì cần GEE.
+    # Hãy upload lên Google Colab và chạy từng cell tại đó.
+    DRIVE_ROOT     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    DRIVE_DATA_DIR = os.path.join(DRIVE_ROOT, "raw")
+    CHECKPOINT_DIR = os.path.join(DRIVE_DATA_DIR, "checkpoints_gee")
+    OUTPUT_CSV     = os.path.join(DRIVE_DATA_DIR, "gee_water_level.csv")
+    print("[LOCAL MODE] File này được thiết kế chạy trên Google Colab.")
+    print("  -> Upload 02_gee_colab.py lên Colab để chạy đầy đủ.")
+    print(f"  -> Kết quả GEE sẽ được lưu tại: {OUTPUT_CSV}")
 
 
 # %% ─────────────────────────────────────────────────────────────
 # CELL 2: Xác thực GEE
 # ─────────────────────────────────────────────────────────────────
-import ee
+# earthengine-api (ee) chỉ hoạt động khi có kết nối GEE.
+# Trên local: import sẽ thành công nếu đã `pip install earthengine-api`,
+# nhưng ee.Initialize() sẽ cần xác thực qua trình duyệt.
+try:
+    import ee
+    _EE_AVAILABLE = True
+except ImportError:
+    _EE_AVAILABLE = False
+    print("[LOCAL] earthengine-api chưa cài. Trên Colab: !pip install earthengine-api")
 
 # ── ĐỔI PROJECT ID TẠI ĐÂY ────────────────────────────────────
-GEE_PROJECT = "datn-495501"   # ← Project ID Google Cloud của bạn
+GEE_PROJECT = "datn-495501"   # <- Project ID Google Cloud của bạn
 
-try:
-    ee.Initialize(project=GEE_PROJECT)
-    _ = ee.Number(1).getInfo()   # Kiểm tra kết nối thực sự
-    print(f"✓ GEE đã khởi tạo (project: {GEE_PROJECT})")
-except Exception:
-    print("→ Cần xác thực, đang mở trình duyệt...")
-    ee.Authenticate()
-    ee.Initialize(project=GEE_PROJECT)
-    print(f"✓ GEE đã xác thực và khởi tạo (project: {GEE_PROJECT})")
+if _EE_AVAILABLE:
+    try:
+        ee.Initialize(project=GEE_PROJECT)
+        _ = ee.Number(1).getInfo()   # Kiểm tra kết nối thực sự
+        print(f"✓ GEE đã khởi tạo (project: {GEE_PROJECT})")
+    except Exception:
+        print("-> Cần xác thực, đang mở trình duyệt...")
+        ee.Authenticate()
+        ee.Initialize(project=GEE_PROJECT)
+        print(f"✓ GEE đã xác thực và khởi tạo (project: {GEE_PROJECT})")
 
 
 # %% ─────────────────────────────────────────────────────────────
@@ -114,25 +142,33 @@ REGION = ee.Geometry.Rectangle([
 GEE_EXPORT_FOLDER = "DATN_GEE_Export"   # Tự động tạo trong Drive
 
 # ── ĐƯỜNG CONG A-H (Diện tích ha → Mực nước m) ────────────────
+# Mở rộng giới hạn dưới xuống 50 ha (gần mực nước chết thực tế)
+# để giảm tỷ lệ phải extrapolate về giá trị fallback.
 AH_CURVE = [
-    ( 200, 36.00),
+    (  50, 34.00),   # Dưới mực nước chết — hiếm gặp, bảo vệ range dưới
+    ( 150, 35.50),
+    ( 200, 36.00),   # Mực nước chết (MNC)
     ( 500, 38.00),
     ( 900, 40.00),
     (1400, 42.00),
     (2000, 44.00),
-    (2500, 46.20),   # MNDBT
+    (2500, 46.20),   # MNDBT — Mực nước dâng bình thường
     (2700, 46.50),
     (2900, 46.90),
     (3050, 47.20),
     (3150, 47.50),
     (3200, 47.80),
-    (3500, 48.25),
+    (3500, 48.25),   # Xấp xỉ mực lũ thiết kế
 ]
 _areas  = [p[0] for p in AH_CURVE]
 _levels = [p[1] for p in AH_CURVE]
+
+# QUAN TRỌNG: fill_value=(np.nan, np.nan) thay vì cứng 36.0
+# → Trả về NaN khi area ngoài phạm vi [50, 3500] ha
+# → postprocess() sẽ loại bỏ các NaN này, không đưa giá trị sai vào model
 ah_to_level = interp1d(_areas, _levels, kind="linear",
                         bounds_error=False,
-                        fill_value=(_levels[0], _levels[-1]))
+                        fill_value=(np.nan, np.nan))
 
 print("✓ Cấu hình hoàn tất.")
 print(f"  Giai đoạn  : {START_YEAR} – {END_YEAR}")
@@ -446,33 +482,85 @@ def load_and_merge_gee_csvs(csv_paths: list) -> pd.DataFrame:
 
 def postprocess(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Làm sạch + ánh xạ diện tích → mực nước qua đường cong A-H.
+    Làm sạch chuyên sâu + ánh xạ diện tích → mực nước qua đường cong A-H.
+
+    Các bước xử lý (theo thứ tự ưu tiên):
+      1. Lọc outlier vật lý (diện tích ngoài phạm vi thực tế hồ Núi Cốc)
+      2. Áp đường cong A-H → NaN cho diện tích < 50 ha
+      3. Loại bỏ NaN từ extrapolation (không còn fallback 36.0m)
+      4. Loại bỏ giá trị mực nước nghi ngờ là fallback cũ (== 36.0)
+      5. Phân cấp chất lượng ảnh
+      6. Deduplication theo ngày — giữ ảnh ít mây nhất mỗi ngày
+      7. Đánh dấu điểm quan trắc thực (is_observed=True) cho pipeline sau
 
     Phân cấp chất lượng dựa trên cloud_scene (% mây toàn cảnh):
-      good : cloud_scene < 30%  → ảnh thoáng, kết quả tin cậy cao
+      good : cloud_scene < 30%  → ảnh thoáng, tin cậy cao
       fair : cloud_scene 30–60% → có mây nhưng QA60 mask đã lọc
-      low  : cloud_scene 60–80% → nên kiểm tra thủ công
+      low  : cloud_scene 60–80% → nên kiểm tra, có thể loại ở bước sau
+
+    Giới hạn vật lý hồ Núi Cốc:
+      Diện tích tối thiểu: 150 ha (trên mực nước chết)
+      Diện tích tối đa  : 3500 ha (xấp xỉ mực lũ thiết kế 47.4m)
     """
+    AREA_MIN_HA = 150    # ha — dưới giá trị này: mây che / sai sót
+    AREA_MAX_HA = 3500   # ha — trên giá trị này: nhiễu mây bóng / lũ hạ lưu
+
     df = df.copy()
     df["water_area_ha"] = pd.to_numeric(df["water_area_ha"], errors="coerce")
     df["cloud_scene"]   = pd.to_numeric(df["cloud_scene"],   errors="coerce")
 
-    n_before = len(df)
-    df = df[df["water_area_ha"] > 100].dropna(subset=["water_area_ha"])
-    print(f"  Loại {n_before - len(df)} bản ghi (diện tích ≤ 100 ha hoặc NaN)")
+    # --- Bước 1: Lọc outlier vật lý ---
+    n0 = len(df)
+    df = df[
+        df["water_area_ha"].between(AREA_MIN_HA, AREA_MAX_HA)
+    ].dropna(subset=["water_area_ha"])
+    print(f"  [Bước 1] Loại {n0 - len(df)} bản ghi ngoài phạm vi vật lý "
+          f"({AREA_MIN_HA}–{AREA_MAX_HA} ha) — còn {len(df)}")
 
-    # Áp đường cong A-H (vectorized)
-    df["water_level_m"] = ah_to_level(df["water_area_ha"].values)
+    # --- Bước 2: Áp đường cong A-H ---
+    # fill_value=NaN → diện tích ngoài AH_CURVE sẽ trả về NaN (không phải 36.0)
+    df["water_level_m"] = ah_to_level(df["water_area_ha"].values).astype(float)
 
-    # Phân cấp chất lượng dựa trên % mây toàn cảnh
+    # --- Bước 3: Loại NaN từ extrapolation ---
+    n1 = len(df)
+    df = df.dropna(subset=["water_level_m"])
+    print(f"  [Bước 3] Loại {n1 - len(df)} bản ghi mực nước NaN (extrapolated) "
+          f"— còn {len(df)}")
+
+    # --- Bước 4: Phân cấp chất lượng ---
     df["quality"] = np.select(
         [df["cloud_scene"] < 30, df["cloud_scene"] < 60, df["cloud_scene"] <= 80],
         ["good",                  "fair",                  "low"],
         default="low",
     )
 
+    # --- Bước 5: Deduplication theo ngày ---
+    # Sentinel-2 có 2 orbit/ngày → giữ ảnh có cloud_scene thấp nhất
+    df = df.sort_values(["date", "cloud_scene"])  # ít mây lên đầu
+    n2 = len(df)
+    df = df.drop_duplicates(subset="date", keep="first")  # giữ ít mây nhất
+    print(f"  [Bước 5] Deduplication: loại {n2 - len(df)} bản ghi trùng ngày "
+          f"— còn {len(df)}")
+
+    # --- Bước 6: Đánh dấu điểm thực ---
+    df["is_observed"] = True
+
     df = df.sort_values("date").reset_index(drop=True)
-    return df[["date", "water_area_ha", "water_level_m", "cloud_scene", "quality"]]
+
+    # Thống kê chất lượng
+    print(f"\n  Phân bố chất lượng sau làm sạch:")
+    for q, cnt in df["quality"].value_counts().items():
+        pct = cnt / len(df) * 100
+        rng_min = df[df["quality"]==q]["water_level_m"].min()
+        rng_max = df[df["quality"]==q]["water_level_m"].max()
+        print(f"    {q:5s}: {cnt:3d} ({pct:5.1f}%) | "
+              f"mực nước [{rng_min:.2f}m – {rng_max:.2f}m]")
+    print(f"  Mực nước: {df['water_level_m'].min():.2f}m – "
+          f"{df['water_level_m'].max():.2f}m")
+    print(f"  Giai đoạn: {df['date'].min().date()} → {df['date'].max().date()}")
+
+    return df[["date", "water_area_ha", "water_level_m",
+               "cloud_scene", "quality", "is_observed"]]
 
 
 # ── Đọc và xử lý ─────────────────────────────────────────────

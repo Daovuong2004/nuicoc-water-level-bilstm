@@ -312,23 +312,42 @@ def area_to_water_level(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["water_area_ha"] = pd.to_numeric(df["water_area_ha"], errors="coerce")
 
-    # Loại bỏ giá trị bất hợp lý (diện tích quá nhỏ → nhiễu)
+    # Loại bỏ outlier vật lý (diện tích ngoài phạm vi hồ Núi Cốc)
     n_before = len(df)
-    df = df[df["water_area_ha"] > 100].copy()
+    df = df[df["water_area_ha"].between(150, 3500)].copy()
     logger.info(
-        "[GEE] Loại %d quan trắc diện tích < 100 ha.", n_before - len(df)
+        "[GEE] Loại %d quan trắc diện tích ngoài phạm vi (150-3500 ha).", n_before - len(df)
     )
 
     # Loại bỏ ảnh mây nhiều
+    n_before = len(df)
     df = df[df["cloud_cover"] < MAX_CLOUD_PERCENT].copy()
+    logger.info(
+        "[GEE] Loại %d quan trắc do mây >= %d%%.", n_before - len(df), MAX_CLOUD_PERCENT
+    )
 
     # Áp dụng đường cong A-H (vectorized)
     df["water_level_m"] = ah_to_level(df["water_area_ha"].values)
 
+    # Loại bỏ mực nước fallback 36.0m (diện tích quá nhỏ, không tin cậy)
+    n_before = len(df)
+    df = df[df["water_level_m"].round(6) != 36.0].copy()
+    logger.info(
+        "[GEE] Loại %d quan trắc có mực nước fallback 36.0m.", n_before - len(df)
+    )
+
+    # Deduplication theo ngày (giữ ảnh ít mây nhất mỗi ngày)
+    n_before = len(df)
+    df = df.sort_values(["date", "cloud_cover"])
+    df = df.drop_duplicates(subset="date", keep="first").copy()
+    logger.info(
+        "[GEE] Khử trùng ngày: loại %d bản ghi trùng.", n_before - len(df)
+    )
+
     # Phân cấp chất lượng ảnh
     df["quality"] = np.where(df["cloud_cover"] < 10, "good", "fair")
 
-    logger.info("[GEE] Tổng quan trắc hợp lệ: %d", len(df))
+    logger.info("[GEE] Tổng quan trắc hợp lệ sau lọc: %d", len(df))
     logger.info(
         "  Chất lượng tốt (mây < 10%%): %d", (df["quality"] == "good").sum()
     )
@@ -336,10 +355,11 @@ def area_to_water_level(df: pd.DataFrame) -> pd.DataFrame:
         "  Chất lượng trung bình (10–15%%): %d",
         (df["quality"] == "fair").sum(),
     )
-    logger.info(
-        "  Mực nước: %.2f – %.2f m",
-        df["water_level_m"].min(), df["water_level_m"].max(),
-    )
+    if len(df) > 0:
+        logger.info(
+            "  Mực nước: %.2f – %.2f m",
+            df["water_level_m"].min(), df["water_level_m"].max(),
+        )
 
     return df[["date", "water_area_ha", "water_level_m",
                "cloud_cover", "quality"]]
@@ -367,6 +387,12 @@ def load_from_gee_export(filepath: str) -> pd.DataFrame:
     """
     df = pd.read_csv(filepath, parse_dates=["date"])
     df = df.sort_values("date").reset_index(drop=True)
+
+    # Đồng bộ hóa tên cột mây từ file export
+    if "cloud_scene" in df.columns and "cloud_cover" not in df.columns:
+        df["cloud_cover"] = df["cloud_scene"]
+    elif "cloud_roi_pct" in df.columns and "cloud_cover" not in df.columns:
+        df["cloud_cover"] = df["cloud_roi_pct"]
 
     # Tính mực nước nếu chưa có (chỉ có diện tích)
     if "water_level_m" not in df.columns:
@@ -399,11 +425,8 @@ def main():
         # Chế độ offline: đọc từ file đã export
         logger.info("[GEE] Phát hiện file export sẵn có — dùng chế độ offline.")
         df_raw = load_from_gee_export(gee_export_path)
-        # Áp dụng bộ lọc chất lượng nếu có cột cloud_cover
-        if "cloud_cover" in df_raw.columns:
-            df = area_to_water_level(df_raw)
-        else:
-            df = df_raw
+        # Áp dụng bộ lọc chất lượng
+        df = area_to_water_level(df_raw)
     else:
         # Chế độ online: chạy trực tiếp trên GEE
         logger.info("[GEE] Chạy trực tiếp trên Earth Engine (theo năm)...")
