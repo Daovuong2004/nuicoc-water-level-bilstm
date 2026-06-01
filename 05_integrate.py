@@ -112,6 +112,42 @@ FEATURE_COLS = [
 TARGET_COL    = "water_level_m"
 FORECAST_DAYS = [1, 3, 7, 14, 30]  # Dự báo 1/3/7/14/30 ngày
 
+# Feature columns cho BiLSTM daily (v4.0 — 26 features)
+FEATURE_COLS = [
+    # --- Khí tượng ngày (6 features) ---
+    "rain_1d",           # Lượng mưa ngày (mm)
+    "rain_3d",           # Mưa tích lũy 3 ngày
+    "rain_7d",           # Mưa tích lũy 7 ngày
+    "rain_14d",          # Mưa tích lũy 14 ngày
+    "rain_30d",          # Mưa tích lũy 30 ngày (mùa vụ) [MỚI]
+    "temperature",       # Nhiệt độ trung bình ngày (°C)
+    "humidity",          # Độ ẩm trung bình ngày (%)
+    # --- Lag mực nước (7 features) ---
+    "water_level_lag1",  # Mực nước ngày hôm qua
+    "water_level_lag3",  # 3 ngày trước
+    "water_level_lag7",  # 7 ngày trước (xu hướng tuần)
+    "water_level_lag14", # 14 ngày trước
+    "water_level_lag30", # 30 ngày trước (xu hướng tháng)
+    "water_level_lag60", # 60 ngày trước (xu hướng mùa) [MỚI]
+    # --- Rolling statistics (5 features) ---
+    "water_level_roll7",  # Trung bình mực nước 7 ngày
+    "water_level_roll30", # Trung bình mực nước 30 ngày
+    "water_level_roll60", # Trung bình mực nước 60 ngày (mùa) [MỚI]
+    "water_level_std7",   # Độ lệch chuẩn mực nước 7 ngày (biến động)
+    # --- Temporal encoding (4 features) ---
+    "month_sin",          # Mã hóa tuần hoàn tháng (sin)
+    "month_cos",          # Mã hóa tuần hoàn tháng (cos)
+    "season_wet",         # Mùa mưa (tháng 5-10)
+    "season_dry",         # Mùa khô (tháng 11-4)
+    # --- Biến đổi thủy văn (2 features) [MỚI] ---
+    "delta_h_7d",         # Thay đổi mực nước so với 7 ngày trước (trend ngắn)
+    "delta_h_30d",        # Thay đổi mực nước so với 30 ngày trước (trend dài)
+    # --- Q_out daily (3 features) ---
+    "dH_dt_daily",        # Tốc độ thay đổi mực nước (m/ngày)
+    "Q_out_daily",        # Lưu lượng xả ước tính ngày (m3/s)
+    "Q_out_roll7",        # Trung bình xả 7 ngày
+]
+
 # Đường cong A-H (giống 02_gee_colab.py) — dùng cho Q_out daily
 AH_CURVE = [
     (  50, 34.00), (150, 35.50), (200, 36.00),
@@ -532,24 +568,30 @@ def build_daily_features(
     pd.DataFrame
         DataFrame đầy đủ features.
     """
-    logger.info("[5e] Xây dựng features ngày...")
+    logger.info("[5e] Xây dựng features ngày..."
+                " (v4.0 — 26 features: +rain_30d, +lag60, +roll60, +delta_h_7d/30d)")
 
     df = df_level.copy()
 
-    # --- Ghép khí tượng ---
+    # --- Khí tượng ---
     nasa_cols = ["rain_1d", "rain_3d", "rain_7d", "rain_14d",
                  "temperature", "humidity"]
     for col in nasa_cols:
         if col in df_nasa_daily.columns:
             df[col] = df_nasa_daily[col].reindex(df.index)
 
+    # Sau khi merge, tính rain_30d từ rain_1d đã ghep (tránh mất dữ liệu 2017-2019)
+    if "rain_1d" in df.columns:
+        df["rain_30d"] = df["rain_1d"].rolling(30, min_periods=1).sum()  # [MỚI]
+
     # --- Lag mực nước ---
-    for lag in [1, 3, 7, 14, 30]:
+    for lag in [1, 3, 7, 14, 30, 60]:
         df[f"water_level_lag{lag}"] = df["water_level_m"].shift(lag)
 
     # --- Rolling statistics ---
     df["water_level_roll7"]  = df["water_level_m"].rolling(7,  min_periods=3).mean()
     df["water_level_roll30"] = df["water_level_m"].rolling(30, min_periods=7).mean()
+    df["water_level_roll60"] = df["water_level_m"].rolling(60, min_periods=14).mean()  # [MỚI]
     df["water_level_std7"]   = df["water_level_m"].rolling(7,  min_periods=3).std()
 
     # --- Temporal encoding (tuần hoàn) ---
@@ -557,6 +599,10 @@ def build_daily_features(
     df["month_cos"]  = np.cos(2 * np.pi * df.index.month / 12)
     df["season_wet"] = df.index.month.isin([5, 6, 7, 8, 9, 10]).astype(int)
     df["season_dry"] = df.index.month.isin([11, 12, 1, 2, 3, 4]).astype(int)
+
+    # --- Biến đổi thủy văn (xu hướng) [MỚI] ---
+    df["delta_h_7d"]  = df["water_level_m"] - df["water_level_lag7"]   # Thay đổi 7 ngày
+    df["delta_h_30d"] = df["water_level_m"] - df["water_level_lag30"]  # Thay đổi 30 ngày
 
     # --- Q_out daily (phương trình cân bằng nước) ---
     # dH/dt (m/ngày)
@@ -682,7 +728,7 @@ def main():
     df = add_forecast_targets(df)
 
     # Cắt hàng đầu/cuối do lag và forecast horizon
-    max_lag     = 30  # water_level_lag30
+    max_lag     = 60  # water_level_lag60 [cập nhật v4.0]
     max_horizon = 30  # target_t30d
     df = df.iloc[max_lag:-max_horizon].copy()
 

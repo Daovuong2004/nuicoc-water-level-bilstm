@@ -1,29 +1,31 @@
 """
-Bước 6: Huấn luyện và đánh giá mô hình Bi-LSTM + Self-Attention
-================================================================
-Kiến trúc mô hình (v3.0):
-  Input(48, 18)
-  → BiLSTM(128, return_seq=True) → Dropout(0.2) → BatchNorm
-  → Multi-Head Self-Attention(heads=4, key_dim=32) → Residual + LayerNorm
-  → BiLSTM(64, return_seq=False)  → Dropout(0.2) → BatchNorm
-  → Dense(32, relu) → Dense(1, linear)
+Bước 6: Huấn luyện và đánh giá mô hình Bi-LSTM
+==================================================
+Kiến trúc mô hình Bi-LSTM (v4.0):
+  Input(60, 26)
+  → BiLSTM(256, return_seq=True) → Dropout(0.25) → BatchNorm
+  → BiLSTM(128, return_seq=False) → Dropout(0.25) → BatchNorm
+  → Dense(64, relu, L2) → Dense(32, relu) → Dense(1, linear)
 
-Cải tiến so với v2.0:
-  1. Multi-Head Self-Attention — học "timestep nào quan trọng nhất"
-     trong cửa sổ 48h (giải quyết long-range dependency)
-  2. Monte Carlo Dropout — ước lượng khoảng tin cậy 95% cho dự báo
-  3. SHAP Feature Importance — giải thích mô hình (XAI)
-  4. Lưu attention weights để visualize
+Cải tiến so với v3.0:
+  1. Bi-LSTM thuần túy — không dùng Self-Attention (đúng tên đề tài)
+  2. Window mở rộng 30 → 60 ngày — bắt được chu kỳ mùa mưa/khô
+  3. LSTM units tăng [128,64] → [256,128] — tăng capacity mô hình
+  4. Huber Loss thay MSE — ít nhạy với đỉnh lũ cực trị
+  5. L2 regularization + Dropout 0.25 — chống overfitting tốt hơn
+  6. Bộ features mới (26 đặc trưng): thêm rain_30d, lag60, roll60, delta_h_7d/30d
 
-Bộ features (18 đặc trưng):
-  - Khí tượng    : rain_1h/6h/24h, temperature, humidity
-  - Lag mực nước : water_level_lag1/2/3/6/12
-  - Cửa xả       : so_cua_xa, dang_xa_cua
-  - Q_out        : Q_out_smooth, Q_out_lag1, Q_out_lag6,
-                   Q_out_roll24, dQout_dt, xa_dot_ngot
+Bộ features (26 đặc trưng):
+  - Khí tượng    : rain_1d/3d/7d/14d/30d, temperature, humidity
+  - Lag mực nước : water_level_lag1/3/7/14/30/60
+  - Rolling stats : roll7/30/60, std7
+  - Temporal      : month_sin/cos, season_wet/dry
+  - Xu hướng     : delta_h_7d, delta_h_30d
+  - Q_out         : dH_dt_daily, Q_out_daily, Q_out_roll7
 
-Cửa sổ đầu vào : 48 giờ
-Đầu ra         : dự báo t+1, t+3, t+6, t+12, t+24 (m)
+Cửa sổ đầu vào : 60 ngày
+Đầu ra         : dự báo t+1, t+3, t+7, t+14, t+30 (m)
+Split          : Train(2017-2022) | Val(2023, EarlyStopping) | Test(2024-2025, báo cáo)
 """
 
 import os
@@ -43,13 +45,12 @@ import tensorflow as tf
 from keras.models import Model
 from keras.layers import (
     Input, Bidirectional, LSTM, Dense, Dropout,
-    BatchNormalization, MultiHeadAttention, LayerNormalization,
-    GlobalAveragePooling1D, Add,
+    BatchNormalization,
 )
+from keras.regularizers import l2
 from keras.callbacks import (
     EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, CSVLogger,
 )
-from keras.saving import register_keras_serializable
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 # Cấu hình logging
@@ -62,33 +63,41 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# CẤU HÌNH SIÊU THAM SỐ
+# CẤU HÌNH SIÊU THAM SỐ (v4.0 — Bi-LSTM thuần túy)
 # ============================================================
-WINDOW_SIZE    = 30            # Cửa sổ nhìn lại (ngày)
+WINDOW_SIZE    = 60            # Cửa sổ nhìn lại (ngày) — 30 → 60 (bắt chu kỳ mùa)
 FORECAST_DAYS  = [1, 3, 7, 14, 30]
 BATCH_SIZE     = 32
-MAX_EPOCHS     = 200
-PATIENCE       = 15
-LSTM_UNITS     = [128, 64]
-DROPOUT_RATE   = 0.2
+MAX_EPOCHS     = 300          # 200 → 300
+PATIENCE       = 20           # 15 → 20 (EarlyStopping kiên nhẫn hơn)
+LSTM_UNITS     = [256, 128]   # [128,64] → [256,128] (tăng capacity)
+DROPOUT_RATE   = 0.25         # 0.2 → 0.25
+L2_REG         = 1e-4         # L2 regularization cho Dense layers [MỚI]
 LEARNING_RATE  = 0.001
-ATTN_HEADS     = 4             # Số đầu Attention
-ATTN_KEY_DIM   = 32            # Chiều key/query của Attention
-MC_SAMPLES     = 50            # Số mẫu Monte Carlo Dropout
+MC_SAMPLES     = 50           # Số mẫu Monte Carlo Dropout
 
 os.makedirs("models",  exist_ok=True)
 os.makedirs("results", exist_ok=True)
 
 
 # ============================================================
-# FEATURE COLUMNS — 18 đặc trưng (đồng bộ với 05_integrate.py)
+# FEATURE COLUMNS — 26 đặc trưng (v4.0, đồng bộ với 05_integrate.py)
 # ============================================================
 FEATURE_COLS = [
-    "rain_1d", "rain_3d", "rain_7d", "rain_14d",
+    # Khí tượng (7 features)
+    "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
     "temperature", "humidity",
-    "water_level_lag1", "water_level_lag3", "water_level_lag7", "water_level_lag14", "water_level_lag30",
-    "water_level_roll7", "water_level_roll30", "water_level_std7",
+    # Lag mực nước (6 features)
+    "water_level_lag1", "water_level_lag3", "water_level_lag7",
+    "water_level_lag14", "water_level_lag30", "water_level_lag60",
+    # Rolling stats (4 features)
+    "water_level_roll7", "water_level_roll30", "water_level_roll60",
+    "water_level_std7",
+    # Temporal (4 features)
     "month_sin", "month_cos", "season_wet", "season_dry",
+    # Xu hướng thủy văn (2 features)
+    "delta_h_7d", "delta_h_30d",
+    # Q_out (3 features)
     "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
 ]
 
@@ -121,15 +130,15 @@ def validate_and_select_features(
     df_test: pd.DataFrame,
 ) -> tuple:
     """
-    Kiểm tra bộ dữ liệu có đủ 21 features (v3.0) không.
+    Kiểm tra bộ dữ liệu có đủ 26 features (v4.0) không.
     """
     missing = [c for c in FEATURE_COLS if c not in df_train.columns]
     if missing:
         raise KeyError(
             f"Thiếu {len(missing)} cột đặc trưng trong dataset: {missing}\n"
-            "Hãy chạy lại '05_integrate.py' để tạo đúng bộ dữ liệu."
+            "Ảy chạy lại '05_integrate.py' để tạo đúng bộ dữ liệu."
         )
-    logger.info("✓ Đủ 21 đặc trưng ngày (v3.0).")
+    logger.info("✓ Đủ 26 đặc trưng ngày (v4.0).")
     return df_train, df_val, df_test, FEATURE_COLS
 
 
@@ -164,31 +173,29 @@ def create_sequences(
 
 
 # ============================================================
-# KIẾN TRÚC MÔ HÌNH Bi-LSTM + MULTI-HEAD SELF-ATTENTION
+# KIẾN TRÚC MÔ HÌNH Bi-LSTM
 # ============================================================
-def build_bilstm_attention(input_shape: tuple, lstm_units: list,
-                            dropout_rate: float) -> Model:
+def build_bilstm(input_shape: tuple, lstm_units: list,
+                  dropout_rate: float) -> Model:
     """
-    Bi-LSTM hai lớp với Multi-Head Self-Attention ở giữa.
+    Bi-LSTM 2 lớp thuần túy — kiến trúc chính của đề tài.
 
-    Lý do dùng Attention trong bài toán thủy văn:
-      Mực nước lúc 8h sáng bị ảnh hưởng bởi cơn mưa lúc 20h hôm qua,
-      không phải chỉ 1h trước. LSTM xử lý kém khi "bước thời gian quan
-      trọng" nằm xa trong sequence. Self-Attention giải quyết điều này:
-      mỗi timestep "nhìn" tất cả các timestep khác và học trọng số
-      quan trọng — cho phép mô hình tập trung vào đỉnh mưa quan trọng
-      dù nó nằm ở đầu cửa sổ 48h.
+    Lý do dùng Bi-LSTM cho bài toán thủy văn:
+      Bi-LSTM xử lý sequence theo cả 2 chiều (xuôi và ngược).
+      Chiều xuôi: học xu hướng tăng mực nước theo mưa tích lũy.
+      Chiều ngược: học bối cảnh thủy văn tương lai (như xu hướng giảm).
+      Kết hợp cả 2 chiều giúp mô hình nắm bắt tốt hơn tính tuần hoàn
+      mùa mưa/khô của hồ chứa.
 
     Kiến trúc:
-      BiLSTM(128) → Dropout → BatchNorm
-      → [Multi-Head Attention (4 heads, key_dim=32) + Residual + LayerNorm]
-      → BiLSTM(64) → Dropout → BatchNorm
-      → Dense(32) → Dense(1)
+      BiLSTM(256) → Dropout(0.25) → BatchNorm
+      → BiLSTM(128) → Dropout(0.25) → BatchNorm
+      → Dense(64, relu, L2) → Dense(32, relu) → Dense(1, linear)
 
     Parameters
     ----------
     input_shape : tuple
-        (window_size, n_features)
+        (window_size, n_features) ví dụ (60, 26)
     lstm_units : list of int
         Số unit LSTM lớp 1 và 2.
     dropout_rate : float
@@ -200,7 +207,7 @@ def build_bilstm_attention(input_shape: tuple, lstm_units: list,
     """
     inputs = Input(shape=input_shape, name="input_sequence")
 
-    # ── Lớp BiLSTM 1: trích xuất đặc trưng chuỗi ──────────────
+    # ── Lớp BiLSTM 1: trích xuất đặc trưng chuỗi ────────────────────────
     x = Bidirectional(
         LSTM(lstm_units[0], return_sequences=True, name="bilstm_1"),
         name="bidirectional_1",
@@ -208,21 +215,7 @@ def build_bilstm_attention(input_shape: tuple, lstm_units: list,
     x = Dropout(dropout_rate, name="dropout_1")(x)
     x = BatchNormalization(name="bn_1")(x)
 
-    # ── Multi-Head Self-Attention ───────────────────────────────
-    # Q = K = V = x (self-attention)
-    # Mỗi timestep "nhìn" toàn bộ sequence, học trọng số tầm quan trọng
-    attn_out = MultiHeadAttention(
-        num_heads=ATTN_HEADS,
-        key_dim=ATTN_KEY_DIM,
-        dropout=dropout_rate,
-        name="multi_head_attention",
-    )(x, x)  # query=x, value=x (self-attention)
-
-    # Residual connection + Layer Normalization (theo kiến trúc Transformer)
-    x = Add(name="residual_add")([x, attn_out])
-    x = LayerNormalization(epsilon=1e-6, name="layer_norm")(x)
-
-    # ── Lớp BiLSTM 2: tổng hợp thành vector cố định ───────────
+    # ── Lớp BiLSTM 2: tổng hợp thành vector cố định ─────────────────
     x = Bidirectional(
         LSTM(lstm_units[1], return_sequences=False, name="bilstm_2"),
         name="bidirectional_2",
@@ -230,11 +223,13 @@ def build_bilstm_attention(input_shape: tuple, lstm_units: list,
     x = Dropout(dropout_rate, name="dropout_2")(x)
     x = BatchNormalization(name="bn_2")(x)
 
-    # ── Lớp Dense: ánh xạ sang không gian dự báo ──────────────
-    x       = Dense(32, activation="relu", name="dense_1")(x)
+    # ── Lớp Dense: ánh xạ sang không gian dự báo ──────────────────
+    x       = Dense(64, activation="relu", kernel_regularizer=l2(L2_REG),
+                    name="dense_1")(x)
+    x       = Dense(32, activation="relu", name="dense_2")(x)
     outputs = Dense(1,  activation="linear", name="output")(x)
 
-    return Model(inputs=inputs, outputs=outputs)
+    return Model(inputs=inputs, outputs=outputs, name="BiLSTM_v4")
 
 
 # ============================================================
@@ -461,15 +456,15 @@ def train_and_evaluate(
     logger.info("  Train: %s | Val (EarlyStopping): %s | Test (Bao cao): %s",
                 X_train.shape, X_val.shape, X_test.shape)
 
-    # Build model
-    model = build_bilstm_attention(
+    # Build model Bi-LSTM thuần túy
+    model = build_bilstm(
         input_shape=(WINDOW_SIZE, len(feature_cols)),
         lstm_units=LSTM_UNITS,
         dropout_rate=DROPOUT_RATE,
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss="mse",
+        loss=tf.keras.losses.Huber(delta=1.0),  # Huber: ít nhạy với outlier/đỉnh lũ
         metrics=["mae"],
     )
 
