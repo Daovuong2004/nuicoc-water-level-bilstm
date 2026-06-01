@@ -54,15 +54,25 @@ sys.path.insert(0, _THIS_DIR)
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-OUTPUT_TRAIN = "data/final/dataset_train.csv"
-OUTPUT_VAL   = "data/final/dataset_val.csv"
-OUTPUT_TEST  = "data/final/dataset_test.csv"
+OUTPUT_TRAIN = "data/final/dataset_train.csv"   # 2017-2022: huan luyen
+OUTPUT_VAL   = "data/final/dataset_val.csv"     # 2023: EarlyStopping (khong bao cao)
+OUTPUT_TEST  = "data/final/dataset_test.csv"    # 2024+: kiem dinh cuoi (bao cao luan van)
 OUTPUT_FULL  = "data/final/dataset_full.csv"
 
-# Phân chia thời gian theo giai đoạn thủy văn
+# ============================================================
+# PHAN CHIA THOI GIAN (3-WAY SPLIT — Quy chuan Thuy loi + LSTM)
+# ============================================================
+# TRAIN (Calibration): 2017-01-01 → 2022-12-31
+#   Dung de fit toan bo tham so Bi-LSTM.
+# VAL   (Internal Validation): 2023-01-01 → 2023-12-31
+#   Dung cho Keras EarlyStopping + ReduceLROnPlateau.
+#   KHONG duoc dung lam ket qua bao cao trong luan van.
+# TEST  (Independent Validation): 2024-01-01 → hien tai
+#   Tap kiem dinh doc lap. Bao gom su kien lu Yagi thang 9/2024.
+#   Day la ket qua duoc bao cao chinh trong luan van.
 TRAIN_END = "2022-12-31"
 VAL_END   = "2023-12-31"
-# Test: 2024-01-01 -> hết (bao gồm lũ Yagi tháng 9/2024)
+# Test: 2024-01-01 -> hien tai (bao gom lu Yagi thang 9/2024)
 
 # Thông số augmentation
 AUG_START           = "2017-01-01"  # Bắt đầu từ khi Sentinel-2A phóng
@@ -691,38 +701,44 @@ def main():
         df.index.min().date(), df.index.max().date()
     )
 
-    # -- Chia train/val/test --
+    # ── Chia 3 tap: Train / Val / Test ──────────────────────────────
+    # Train : Fit toan bo tham so Bi-LSTM (calibration)
+    # Val   : EarlyStopping + ReduceLR (internal validation, KHONG bao cao)
+    # Test  : Kiem dinh doc lap — BAO CAO chinh trong luan van
     df_train = df[df.index <= TRAIN_END].copy()
     df_val   = df[(df.index > TRAIN_END) & (df.index <= VAL_END)].copy()
     df_test  = df[df.index > VAL_END].copy()
 
-    logger.info("\n[Split] Chia du lieu:")
+    logger.info("\n[Split] 3-Way Split (Train / Val / Test):")
     logger.info(
-        "  Train : %d ngay (%s -> %s)",
+        "  Train (Calibration)          : %d ngay (%s -> %s)",
         len(df_train),
         df_train.index.min().date(), df_train.index.max().date()
     )
     logger.info(
-        "  Val   : %d ngay (%s -> %s)",
+        "  Val   (EarlyStopping/Tuning) : %d ngay (%s -> %s)  <- khong bao cao",
         len(df_val),
         df_val.index.min().date(), df_val.index.max().date()
     )
     logger.info(
-        "  Test  : %d ngay (%s -> %s) <- bao gom lu Yagi 2024",
+        "  Test  (Kiem dinh doc lap)    : %d ngay (%s -> %s)  <- BAO CAO LUAN VAN",
         len(df_test),
         df_test.index.min().date(), df_test.index.max().date()
     )
 
-    # Cảnh báo dataset nhỏ
-    if len(df_train) < 200:
+    # Canh bao dataset nho
+    if len(df_train) < 300:
         logger.warning(
-            "CANH BAO: Train chi co %d ngay (nen >= 200 de BiLSTM on dinh).",
+            "CANH BAO: Train chi co %d ngay (nen >= 300 de Bi-LSTM on dinh).",
             len(df_train)
         )
-    if len(df_val) < 50:
-        logger.warning("CANH BAO: Val chi co %d ngay (nen >= 50).", len(df_val))
-    if len(df_test) < 50:
-        logger.warning("CANH BAO: Test chi co %d ngay (nen >= 50).", len(df_test))
+    if len(df_val) < 60:
+        logger.warning("CANH BAO: Val chi co %d ngay (nen >= 60 cho EarlyStopping).", len(df_val))
+    if len(df_test) < 100:
+        logger.warning(
+            "CANH BAO: Test chi co %d ngay (nen >= 100 de ket qua kiem dinh tin cay).",
+            len(df_test)
+        )
 
     # -- Chuẩn hóa --
     logger.info("\n[Normalize] Min-Max (fit only on train)...")
@@ -740,9 +756,8 @@ def main():
     logger.info("  %s (%d dong)", OUTPUT_VAL,   len(df_val))
     logger.info("  %s (%d dong)", OUTPUT_TEST,  len(df_test))
 
-    # Tóm tắt
     logger.info("\n" + "=" * 65)
-    logger.info("TOM TAT BO DU LIEU NGAY:")
+    logger.info("TOM TAT BO DU LIEU (3-WAY SPLIT):")
     logger.info(
         "  Tong: %d ngay | Train: %d | Val: %d | Test: %d",
         len(df), len(df_train), len(df_val), len(df_test)
@@ -752,6 +767,10 @@ def main():
     if "is_observed" in df.columns:
         obs_pct = int(df["is_observed"].mean() * 100)
         logger.info("  Ty le diem thuc / tong: ~%d%%", obs_pct)
+    logger.info(
+        "  [QUAN TRONG] Val (2023) chi dung cho EarlyStopping."
+        " Ket qua bao cao lay tu Test (2024+)."
+    )
     logger.info("=" * 65)
     logger.info("\nBuoc 5 hoan thanh -- Chay tiep: python 06_bilstm_model.py")
 

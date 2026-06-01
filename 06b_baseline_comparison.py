@@ -850,27 +850,37 @@ def main() -> None:
     logger.info("  Thời gian: %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
     logger.info("=" * 65)
 
-    # ── 1. Load dữ liệu ────────────────────────────────────────
-    logger.info("\n[Load] Đọc bộ dữ liệu từ data/final/ ...")
+    # ── 1. Load du lieu ──────────────────────────────────────────
+    # Train (2017-2022): Calibration
+    # Val   (2023)     : EarlyStopping cho LSTM/Bi-LSTM baseline (khong bao cao)
+    # Test  (2024+)    : Kiem dinh doc lap \u2014 BAO CAO chinh trong luan van
+    logger.info("\n[Load] Doc bo du lieu tu data/final/ ...")
     df_train = load_dataset_csv("data/final/dataset_train.csv")
     df_val   = load_dataset_csv("data/final/dataset_val.csv")
     df_test  = load_dataset_csv("data/final/dataset_test.csv")
 
     logger.info(
-        "  Train : %d bản ghi (%s → %s)",
+        "  Train (Calibration)       : %d ban ghi (%s -> %s)",
         len(df_train),
         df_train.index.min().date(), df_train.index.max().date(),
     )
     logger.info(
-        "  Val   : %d bản ghi (%s → %s)",
+        "  Val   (EarlyStopping)     : %d ban ghi (%s -> %s)  <- khong bao cao",
         len(df_val),
         df_val.index.min().date(), df_val.index.max().date(),
     )
     logger.info(
-        "  Test  : %d bản ghi (%s → %s)",
+        "  Test  (Kiem dinh doc lap) : %d ban ghi (%s -> %s)  <- BAO CAO LUAN VAN",
         len(df_test),
         df_test.index.min().date(), df_test.index.max().date(),
     )
+
+    # Kiem tra data leakage: Val phai ket thuc TRUOC khi Test bat dau
+    assert df_val.index.max() < df_test.index.min(), (
+        f"DATA LEAKAGE: Val ket thuc {df_val.index.max().date()} "
+        f">= Test bat dau {df_test.index.min().date()}!"
+    )
+    logger.info("  [OK] Khong co data leakage (Val < Test, khong chong cheo).")
 
     # ── 2. Kiểm tra và chọn feature set ───────────────────────
     missing_q = [c for c in FEATURE_COLS if c not in df_train.columns]

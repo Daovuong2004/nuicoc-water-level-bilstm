@@ -23,6 +23,9 @@ NASA_POWER_PATH = os.path.join(DATA_DIR, "raw", "nasa_power_hourly.csv")
 GEE_PATH        = os.path.join(DATA_DIR, "raw", "gee_water_level.csv")
 
 # Du lieu da xu ly
+# dataset_train.csv : 2017-2022  — tap huan luyen
+# dataset_val.csv   : 2023       — tap EarlyStopping (khong bao cao)
+# dataset_test.csv  : 2024+      — tap kiem dinh cuoi (bao cao luan van)
 TRAIN_PATH = os.path.join(DATA_DIR, "final", "dataset_train.csv")
 VAL_PATH   = os.path.join(DATA_DIR, "final", "dataset_val.csv")
 TEST_PATH  = os.path.join(DATA_DIR, "final", "dataset_test.csv")
@@ -34,10 +37,26 @@ SCALER_PATH = os.path.join(MODEL_DIR, "feature_scaler_daily.pkl")
 
 # ============================================================
 # PHAN CHIA THOI GIAN (Train / Val / Test)
+# Quy chuan nghien cuu thuy loi + hoc sau (LSTM/Bi-LSTM):
 # ============================================================
-TRAIN_END = "2022-12-31"  # Train: 2017-01-01 → 2022-12-31
-VAL_END   = "2023-12-31"  # Val  : 2023-01-01 → 2023-12-31
-                           # Test : 2024-01-01 → hien tai (lu Yagi 9/2024)
+#
+#  TRAIN  (Hieu chinh - Calibration):
+#    2017-01-01 → 2022-12-31  (~6 nam, ~2000 ngay)
+#    Muc dich: Fit toan bo tham so Bi-LSTM
+#
+#  VAL    (Kiem tra noi bo - Internal Validation):
+#    2023-01-01 → 2023-12-31  (~365 ngay)
+#    Muc dich: EarlyStopping + lua chon sieu tham so (hoc sieu tham so)
+#    !! TUYET DOI khong dung de chon mo hinh cuoi / bao cao ket qua !!
+#
+#  TEST   (Kiem dinh doc lap - Independent Validation):
+#    2024-01-01 → hien tai     (~700 ngay, bao gom lu Yagi 9/2024)
+#    Muc dich: Danh gia cuoi, bao cao RMSE/MAE/NSE trong luan van
+#    !! Du lieu nay KHONG DUOC dung trong bat ky buoc train/val nao !!
+#
+TRAIN_END = "2022-12-31"   # Ket thuc tap Train
+VAL_END   = "2023-12-31"   # Ket thuc tap Val (EarlyStopping)
+                            # Test bat dau tu 2024-01-01 den hien tai
 
 
 # ============================================================

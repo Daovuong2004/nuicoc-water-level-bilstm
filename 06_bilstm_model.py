@@ -452,11 +452,14 @@ def train_and_evaluate(
                 f"Chạy lại 05_integrate.py."
             )
 
-    # Tạo sequences
+    # Tao sequences
+    # X_val  -> dung cho EarlyStopping + ReduceLR (khong dung de bao cao)
+    # X_test -> dung de tinh RMSE/MAE/NSE bao cao trong luan van
     X_train, y_train, _        = create_sequences(df_train, feature_cols, target_col, WINDOW_SIZE)
     X_val,   y_val,   _        = create_sequences(df_val,   feature_cols, target_col, WINDOW_SIZE)
     X_test,  y_test,  ts_test  = create_sequences(df_test,  feature_cols, target_col, WINDOW_SIZE)
-    logger.info("  Train: %s | Val: %s | Test: %s", X_train.shape, X_val.shape, X_test.shape)
+    logger.info("  Train: %s | Val (EarlyStopping): %s | Test (Bao cao): %s",
+                X_train.shape, X_val.shape, X_test.shape)
 
     # Build model
     model = build_bilstm_attention(
@@ -497,17 +500,19 @@ def train_and_evaluate(
     # ── Dự báo trung bình (deterministic) ────────────────────
     y_pred_val  = model.predict(X_val,  verbose=0).flatten()
 
-    # ── Dự báo với MC Dropout (probabilistic) ────────────────
-    logger.info("  [MC Dropout] Chạy %d mẫu để ước lượng khoảng tin cậy...", MC_SAMPLES)
+    # ── Du bao xac suat voi MC Dropout (Test set) ────────────────────
+    logger.info("  [MC Dropout] Chay %d mau de uoc luong khoang tin cay...", MC_SAMPLES)
     y_pred_test_mean, y_pred_test_lo, y_pred_test_hi = predict_with_mc_dropout(
         model, X_test, n_samples=MC_SAMPLES
     )
 
-    # Đánh giá
-    metrics_val  = evaluate_metrics(y_val, y_pred_val,
-                                    label=f"Val  t+{horizon_d}d")
+    # Danh gia:
+    #   metrics_val  -> chi dung de theo doi overfitting (khong bao cao)
+    #   metrics_test -> KET QUA BAO CAO chinh trong luan van
+    metrics_val  = evaluate_metrics(y_val, model.predict(X_val, verbose=0).flatten(),
+                                    label=f"Val  (EarlyStopping) t+{horizon_d}d")
     metrics_test = evaluate_metrics(y_test, y_pred_test_mean,
-                                    label=f"Test t+{horizon_d}d (Yagi)")
+                                    label=f"Test (Kiem dinh doc lap) t+{horizon_d}d")
 
     # Lưu kết quả
     df_result = pd.DataFrame({
@@ -596,23 +601,31 @@ def plot_results(df_result: pd.DataFrame, history,
 # BẢNG TỔNG HỢP
 # ============================================================
 def print_summary_table(all_metrics: dict) -> None:
-    """In bảng tổng hợp và lưu JSON kết quả."""
-    print("\n" + "=" * 70)
-    print("  BẢNG TỔNG HỢP — Bi-LSTM + Self-Attention (Hồ Núi Cốc)")
-    print("=" * 70)
-    print(f"{'Khoảng':>10} | {'RMSE (m)':>10} | {'MAE (m)':>10} | {'NSE':>8} | {'Đánh giá':>10}")
-    print("-" * 70)
+    """In bang tong hop va luu JSON ket qua.
+
+    Chi bao cao chi so tren tap TEST (kiem dinh doc lap 2024-2025).
+    Chi so Val chi hien thi de tham khao kiem tra overfitting.
+    """
+    print("\n" + "=" * 74)
+    print("  BANG TONG HOP — Bi-LSTM + Self-Attention (Ho Nui Coc)")
+    print("  [BAO CAO CHINH: Test 2024-2025 — bao gom lu Yagi 9/2024]")
+    print("=" * 74)
+    print(f"{'Khoang':>10} | {'RMSE (m)':>10} | {'MAE (m)':>10} | {'NSE':>8} | {'Danh gia':>10}")
+    print("-" * 74)
 
     for d, (val_m, test_m) in all_metrics.items():
         nse = test_m["nse"]
-        tag = "Tốt ✓" if nse >= 0.75 else ("Khá" if nse >= 0.60 else "Yếu ✗")
+        tag = "Tot" if nse >= 0.75 else ("Kha" if nse >= 0.60 else "Yeu")
         print(
-            f"  t+{d:>2}d (Test) | "
+            f"  t+{d:>2}d [Test] | "
             f"{test_m['rmse']:>10.4f} | "
             f"{test_m['mae']:>10.4f} | "
             f"{nse:>8.4f} | {tag:>10}"
         )
-    print("=" * 70)
+    print("=" * 74)
+    print("  Val (2023, EarlyStopping) metrics [chi tham khao overfitting]:")
+    for d, (val_m, test_m) in all_metrics.items():
+        print(f"    t+{d:>2}d [Val ]: RMSE={val_m['rmse']:.4f}m  NSE={val_m['nse']:.4f}")
 
     results_json = {f"t+{d}d": {"val": v, "test": t}
                     for d, (v, t) in all_metrics.items()}
@@ -633,18 +646,23 @@ def main():
     tf.random.set_seed(42)
     np.random.seed(42)
 
-    # Load dữ liệu
-    logger.info("\n[Load] Đọc dữ liệu từ data/final/ ...")
+    logger.info("\n[Load] Doc du lieu tu data/final/ ...")
     df_train = load_dataset_csv("data/final/dataset_train.csv")
     df_val   = load_dataset_csv("data/final/dataset_val.csv")
     df_test  = load_dataset_csv("data/final/dataset_test.csv")
 
-    logger.info("  Train : %d bản ghi (%s → %s)",
+    logger.info("  Train (Calibration)       : %d ban ghi (%s -> %s)",
                 len(df_train), df_train.index.min().date(), df_train.index.max().date())
-    logger.info("  Val   : %d bản ghi (%s → %s)",
+    logger.info("  Val   (EarlyStopping)     : %d ban ghi (%s -> %s)  <- khong bao cao",
                 len(df_val), df_val.index.min().date(), df_val.index.max().date())
-    logger.info("  Test  : %d bản ghi (%s → %s)",
+    logger.info("  Test  (Kiem dinh doc lap) : %d ban ghi (%s -> %s)  <- BAO CAO LUAN VAN",
                 len(df_test), df_test.index.min().date(), df_test.index.max().date())
+
+    # Dam bao khong co data leakage: tap Val phai ket thuc truoc tap Test
+    assert df_val.index.max() < df_test.index.min(), (
+        f"DATA LEAKAGE: Val ket thuc {df_val.index.max().date()} "
+        f">= Test bat dau {df_test.index.min().date()}!"
+    )
 
     # Chọn feature set
     df_train, df_val, df_test, feature_cols = validate_and_select_features(
