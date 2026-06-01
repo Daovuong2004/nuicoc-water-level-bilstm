@@ -439,8 +439,8 @@ def run_sarima_baseline(
         y_true   = []   # Giá trị thực tế tại mỗi bước dự báo
         y_pred   = []   # Giá trị dự báo của SARIMA
 
-        # Refitting mỗi 7 ngày để tránh drift quá lớn và chạy nhanh hơn
-        refit_interval = 7
+        # Refitting mỗi 30 ngày để tránh drift quá lớn và chạy nhanh hơn nhiều
+        refit_interval = 30
         history        = train_series.copy()
 
         for i in range(n_test - horizon_d):
@@ -455,9 +455,9 @@ def run_sarima_baseline(
                         enforce_stationarity=False,
                         enforce_invertibility=False,
                     )
-                    sarima_fit = sarima_model.fit(disp=False, maxiter=100)
+                    sarima_fit = sarima_model.fit(disp=False, maxiter=15)
 
-                if i % 60 == 0:
+                if i % 120 == 0:
                     logger.info(
                         "  [SARIMA] Bước %d/%d — đã fit lại mô hình.",
                         i, n_test - horizon_d,
