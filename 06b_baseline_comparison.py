@@ -27,10 +27,20 @@ Tập kiểm tra: Lũ Yagi tháng 9/2024
 """
 
 import os
+import sys
 import json
 import logging
 import warnings
 from datetime import datetime
+
+# Ensure standard output and error output use UTF-8 to prevent UnicodeEncodeError on Windows
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 import numpy as np
 import pandas as pd
@@ -75,8 +85,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CẤU HÌNH SIÊU THAM SỐ
 # ============================================================
-WINDOW_SIZE    = 48           # Số giờ nhìn lại (input sequence length)
-FORECAST_HOURS = [1, 3, 6, 12, 24]   # Các khoảng dự báo (giờ)
+WINDOW_SIZE    = 30           # Số ngày nhìn lại (input sequence length)
+FORECAST_DAYS  = [1, 3, 7, 14, 30]   # Các khoảng dự báo (ngày)
 BATCH_SIZE     = 32
 MAX_EPOCHS     = 200
 PATIENCE_ES    = 15           # EarlyStopping patience
@@ -93,36 +103,13 @@ os.makedirs("results", exist_ok=True)
 # ============================================================
 # FEATURE COLUMNS
 # ============================================================
-# Bộ đặc trưng đầy đủ v2.0 — 18 features (đồng bộ với 06_bilstm_model.py)
-# Nhóm 1: Khí tượng (5)
-# Nhóm 2: Lag mực nước (5)
-# Nhóm 3: Cửa xả (2)
-# Nhóm 4: Q_out — lưu lượng xả suy luận (6)
 FEATURE_COLS = [
-    # --- Khí tượng ---
-    "rain_1h", "rain_6h", "rain_24h",
+    "rain_1d", "rain_3d", "rain_7d", "rain_14d",
     "temperature", "humidity",
-    # --- Lag mực nước ---
-    "water_level_lag1", "water_level_lag2", "water_level_lag3",
-    "water_level_lag6", "water_level_lag12",
-    # --- Cửa xả ---
-    "so_cua_xa", "dang_xa_cua",
-    # --- Q_out (lưu lượng xả suy luận) ---
-    "Q_out_smooth",   # Lưu lượng xả đã làm mịn (m³/s)
-    "Q_out_lag1",     # Q_out 1 giờ trước — xu hướng tức thì
-    "Q_out_lag6",     # Q_out 6 giờ trước — xu hướng ngắn hạn
-    "Q_out_roll24",   # Trung bình Q_out 24 giờ — xu hướng ngày
-    "dQout_dt",       # Tốc độ thay đổi Q_out (gia tốc xả)
-    "xa_dot_ngot",    # Flag xả đột ngột (0/1)
-]
-
-# Feature set dự phòng v1.0 — 12 features (khi CSV thiếu cột Q_out)
-FEATURE_COLS_FALLBACK = [
-    "rain_1h", "rain_6h", "rain_24h",
-    "temperature", "humidity",
-    "water_level_lag1", "water_level_lag2", "water_level_lag3",
-    "water_level_lag6", "water_level_lag12",
-    "so_cua_xa", "dang_xa_cua",
+    "water_level_lag1", "water_level_lag3", "water_level_lag7", "water_level_lag14", "water_level_lag30",
+    "water_level_roll7", "water_level_roll30", "water_level_std7",
+    "month_sin", "month_cos", "season_wet", "season_dry",
+    "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
 ]
 
 TARGET_COL = "water_level_m"   # Cột mực nước thực tế (m)
@@ -409,20 +396,20 @@ def build_bilstm_simple(input_shape: tuple) -> Model:
 def run_sarima_baseline(
     df_train: pd.DataFrame,
     df_test: pd.DataFrame,
-    horizon_h: int,
+    horizon_d: int,
 ) -> tuple | None:
     """
     Chạy SARIMA làm baseline thống kê.
 
     Cấu hình SARIMAX:
-        order          = (2, 1, 2)     — AR(2), sai phân bậc 1, MA(2)
-        seasonal_order = (1, 1, 1, 24) — chu kỳ ngày 24h
+        order          = (2, 1, 2)    — AR(2), sai phân bậc 1, MA(2)
+        seasonal_order = (1, 1, 1, 7) — chu kỳ tuần 7 ngày
 
     Chiến lược rolling forecast:
-        - Mỗi 24h fit lại mô hình 1 lần để cân bằng giữa độ chính xác
-          và tốc độ tính toán (tránh fit lại từng giờ).
-        - Dự báo horizon_h bước tới từ thời điểm hiện tại.
-        - Lấy giá trị tại bước horizon_h làm dự báo.
+        - Mỗi 7 ngày fit lại mô hình 1 lần để cân bằng giữa độ chính xác
+          và tốc độ tính toán (tránh fit lại từng bước).
+        - Dự báo horizon_d bước tới từ thời điểm hiện tại.
+        - Lấy giá trị tại bước horizon_d làm dự báo.
 
     Parameters
     ----------
@@ -430,8 +417,8 @@ def run_sarima_baseline(
         Dữ liệu huấn luyện — SARIMA chỉ dùng cột water_level_m.
     df_test : pd.DataFrame
         Dữ liệu kiểm tra để đánh giá.
-    horizon_h : int
-        Khoảng dự báo tính bằng giờ (1, 3, 6, 12, 24).
+    horizon_d : int
+        Khoảng dự báo tính bằng ngày (1, 3, 7, 14, 30).
 
     Returns
     -------
@@ -452,11 +439,11 @@ def run_sarima_baseline(
         y_true   = []   # Giá trị thực tế tại mỗi bước dự báo
         y_pred   = []   # Giá trị dự báo của SARIMA
 
-        # Refitting mỗi 24h để tránh drift quá lớn
-        refit_interval = 24
+        # Refitting mỗi 7 ngày để tránh drift quá lớn và chạy nhanh hơn
+        refit_interval = 7
         history        = train_series.copy()
 
-        for i in range(n_test - horizon_h):
+        for i in range(n_test - horizon_d):
             # Fit lại mô hình SARIMA mỗi refit_interval bước
             if i % refit_interval == 0:
                 with warnings.catch_warnings():
@@ -464,26 +451,26 @@ def run_sarima_baseline(
                     sarima_model = SARIMAX(
                         history,
                         order=(2, 1, 2),
-                        seasonal_order=(1, 1, 1, 24),
+                        seasonal_order=(1, 1, 1, 7),
                         enforce_stationarity=False,
                         enforce_invertibility=False,
                     )
                     sarima_fit = sarima_model.fit(disp=False, maxiter=100)
 
-                if i % 120 == 0:
+                if i % 60 == 0:
                     logger.info(
                         "  [SARIMA] Bước %d/%d — đã fit lại mô hình.",
-                        i, n_test - horizon_h,
+                        i, n_test - horizon_d,
                     )
 
-            # Dự báo horizon_h bước tới
-            forecast = sarima_fit.forecast(steps=horizon_h)
+            # Dự báo horizon_d bước tới
+            forecast = sarima_fit.forecast(steps=horizon_d)
             pred_val = float(forecast.iloc[-1]) if hasattr(forecast, "iloc") \
                 else float(forecast[-1])
 
-            # Ghi nhận dự báo và thực tế tại bước horizon_h
+            # Ghi nhận dự báo và thực tế tại bước horizon_d
             y_pred.append(pred_val)
-            y_true.append(test_series[i + horizon_h])
+            y_true.append(test_series[i + horizon_d])
 
             # Cập nhật lịch sử với giá trị thực tế (rolling)
             history.append(test_series[i])
@@ -506,7 +493,7 @@ def train_keras_model(
     X_val: np.ndarray,
     y_val: np.ndarray,
     model_name: str,
-    horizon_h: int,
+    horizon_d: int,
 ) -> object:
     """
     Huấn luyện mô hình Keras với EarlyStopping và ReduceLROnPlateau.
@@ -514,7 +501,7 @@ def train_keras_model(
     Callbacks:
         EarlyStopping     : patience=15, khôi phục trọng số tốt nhất
         ReduceLROnPlateau : factor=0.5, patience=7, min_lr=1e-6
-        ModelCheckpoint   : lưu model tốt nhất vào models/{model_name}_t{h}h.keras
+        ModelCheckpoint   : lưu model tốt nhất vào models/{model_name}_t{d}d.keras
 
     Parameters
     ----------
@@ -526,15 +513,15 @@ def train_keras_model(
         Dữ liệu validation.
     model_name : str
         Tên định danh mô hình (dùng để đặt tên file lưu).
-    horizon_h : int
-        Khoảng dự báo tính bằng giờ.
+    horizon_d : int
+        Khoảng dự báo tính bằng ngày.
 
     Returns
     -------
     keras.callbacks.History
         Lịch sử huấn luyện (loss, val_loss theo epoch).
     """
-    model_path = f"models/{model_name}_t{horizon_h}h.keras"
+    model_path = f"models/{model_name}_t{horizon_d}d.keras"
 
     callbacks = [
         # Dừng sớm nếu val_loss không cải thiện sau PATIENCE_ES epoch
@@ -562,8 +549,8 @@ def train_keras_model(
     ]
 
     logger.info(
-        "  [%s] Bắt đầu huấn luyện t+%dh — train: %s, val: %s",
-        model_name, horizon_h, X_train.shape, X_val.shape,
+        "  [%s] Bắt đầu huấn luyện t+%dd — train: %s, val: %s",
+        model_name, horizon_d, X_train.shape, X_val.shape,
     )
 
     history = model.fit(
@@ -659,7 +646,7 @@ def plot_comparison_bar(
 
     # Định dạng trục và tiêu đề
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([f"t+{h}h" for h in horizons], fontsize=11)
+    ax.set_xticklabels([f"t+{h}d" for h in horizons], fontsize=11)
     ax.set_xlabel("Khoảng dự báo", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=13, fontweight="bold", pad=12)
@@ -746,7 +733,7 @@ def save_results_json(all_results: dict) -> None:
     # Chuyển đổi None thành dict rỗng và làm sạch NaN để serialize được JSON
     json_ready = {}
     for h, model_dict in all_results.items():
-        key = f"t+{h}h"
+        key = f"t+{h}d"
         json_ready[key] = {}
         for model_name, metrics in model_dict.items():
             if metrics is None:
@@ -777,7 +764,7 @@ def _print_ascii_table(all_results: dict) -> None:
     │  Khoảng  │  SARIMA        │  LSTM          │  Bi-LSTM       │ Bi-LSTM+Attn│
     │          │ RMSE  MAE  NSE │ RMSE  MAE  NSE │ RMSE  MAE  NSE │RMSE MAE NSE│
     ├──────────┼────────────────┼────────────────┼────────────────┼────────────┤
-    │  t+ 1h   │ 0.xxx 0.xx x.xx│ ...
+    │  t+ 1d   │ 0.xxx 0.xx x.xx│ ...
     └──────────┴─────────────────────────────────────────────────────────────────┘
     """
     horizons   = sorted(all_results.keys())
@@ -805,7 +792,7 @@ def _print_ascii_table(all_results: dict) -> None:
 
     # Dữ liệu từng khoảng dự báo
     for h in horizons:
-        row = f"  t+{h:>2}h   |"
+        row = f"  t+{h:>2}d   |"
         for model_name in MODEL_NAMES:
             metrics = all_results[h].get(model_name)
             if metrics is None:
@@ -886,20 +873,15 @@ def main() -> None:
     )
 
     # ── 2. Kiểm tra và chọn feature set ───────────────────────
-    qout_cols  = [c for c in FEATURE_COLS if c not in FEATURE_COLS_FALLBACK]
-    missing_q  = [c for c in qout_cols if c not in df_train.columns]
+    missing_q = [c for c in FEATURE_COLS if c not in df_train.columns]
 
     if missing_q:
-        logger.warning(
-            "Thiếu %d cột Q_out: %s", len(missing_q), missing_q
+        raise KeyError(
+            f"Thiếu {len(missing_q)} cột đặc trưng trong dataset: {missing_q}\n"
+            "Hãy chạy lại '05_integrate.py' để tạo đúng bộ dữ liệu."
         )
-        logger.warning(
-            "→ Fallback về feature set v1.0 (12 features) cho LSTM và Bi-LSTM.\n"
-            "  Bi-LSTM+Attn vẫn load từ file .keras đã huấn luyện trước."
-        )
-        feature_cols = FEATURE_COLS_FALLBACK
     else:
-        logger.info("✓ Đủ 18 features (v2.0 với Q_out).")
+        logger.info("✓ Đủ 21 features ngày (v3.0).")
         feature_cols = FEATURE_COLS
 
     n_features = len(feature_cols)
@@ -909,13 +891,13 @@ def main() -> None:
     # Sequences cho test sẽ tạo bên trong loop theo từng target_col
 
     # ── 3. Loop qua từng khoảng dự báo ────────────────────────
-    # all_results[horizon_h][model_name] = {'rmse':…, 'mae':…, 'nse':…} | None
-    all_results = {h: {} for h in FORECAST_HOURS}
+    # all_results[horizon_d][model_name] = {'rmse':…, 'mae':…, 'nse':…} | None
+    all_results = {h: {} for h in FORECAST_DAYS}
 
-    for h in FORECAST_HOURS:
-        target_col = f"target_t{h}h"
+    for h in FORECAST_DAYS:
+        target_col = f"target_t{h}d"
         logger.info("\n%s", "─" * 60)
-        logger.info("  DỰ BÁO t+%dh", h)
+        logger.info("  DỰ BÁO t+%dd", h)
         logger.info("─" * 60)
 
         # Kiểm tra cột target tồn tại
@@ -946,10 +928,10 @@ def main() -> None:
         if sarima_result is not None:
             y_true_s, y_pred_s = sarima_result
             all_results[h]["SARIMA"] = evaluate_metrics(
-                y_true_s, y_pred_s, label=f"SARIMA t+{h}h"
+                y_true_s, y_pred_s, label=f"SARIMA t+{h}d"
             )
         else:
-            logger.warning("  [SARIMA] Bỏ qua t+%dh.", h)
+            logger.warning("  [SARIMA] Bỏ qua t+%dd.", h)
             all_results[h]["SARIMA"] = None
 
         # ── 3b. LSTM đơn chiều ──────────────────────────────────
@@ -962,11 +944,11 @@ def main() -> None:
             X_train=X_train, y_train=y_train,
             X_val=X_val,     y_val=y_val,
             model_name="lstm_uni",
-            horizon_h=h,
+            horizon_d=h,
         )
         y_pred_lstm = lstm_model.predict(X_test, verbose=0).flatten()
         all_results[h]["LSTM"] = evaluate_metrics(
-            y_test, y_pred_lstm, label=f"LSTM t+{h}h"
+            y_test, y_pred_lstm, label=f"LSTM t+{h}d"
         )
 
         # ── 3c. Bi-LSTM đơn giản (không Attention) ─────────────
@@ -979,22 +961,22 @@ def main() -> None:
             X_train=X_train, y_train=y_train,
             X_val=X_val,     y_val=y_val,
             model_name="bilstm_simple",
-            horizon_h=h,
+            horizon_d=h,
         )
         y_pred_bilstm = bilstm_model.predict(X_test, verbose=0).flatten()
         all_results[h]["Bi-LSTM"] = evaluate_metrics(
-            y_test, y_pred_bilstm, label=f"Bi-LSTM t+{h}h"
+            y_test, y_pred_bilstm, label=f"Bi-LSTM t+{h}d"
         )
 
         # ── 3d. Bi-LSTM + Attention (load từ bước 06) ──────────
-        attn_model_path = f"models/bilstm_t{h}h.keras"
+        attn_model_path = f"models/bilstm_t{h}d.keras"
         logger.info("\n  → [4/4] Bi-LSTM+Attention — load từ: %s", attn_model_path)
 
         if not os.path.exists(attn_model_path):
             logger.warning(
                 "  CẢNH BÁO: Chưa tìm thấy '%s'.\n"
                 "  → Hãy chạy '06_bilstm_model.py' trước để huấn luyện.\n"
-                "  → Bỏ qua Bi-LSTM+Attn cho t+%dh.",
+                "  → Bỏ qua Bi-LSTM+Attn cho t+%dd.",
                 attn_model_path, h,
             )
             all_results[h]["Bi-LSTM+Attn"] = None
@@ -1003,7 +985,7 @@ def main() -> None:
                 attn_model  = load_model(attn_model_path)
                 y_pred_attn = attn_model.predict(X_test, verbose=0).flatten()
                 all_results[h]["Bi-LSTM+Attn"] = evaluate_metrics(
-                    y_test, y_pred_attn, label=f"Bi-LSTM+Attn t+{h}h"
+                    y_test, y_pred_attn, label=f"Bi-LSTM+Attn t+{h}d"
                 )
             except Exception as exc:
                 logger.error(

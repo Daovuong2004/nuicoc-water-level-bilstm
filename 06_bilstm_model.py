@@ -64,8 +64,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CẤU HÌNH SIÊU THAM SỐ
 # ============================================================
-WINDOW_SIZE    = 48            # Cửa sổ nhìn lại (giờ)
-FORECAST_HOURS = [1, 3, 6, 12, 24]
+WINDOW_SIZE    = 30            # Cửa sổ nhìn lại (ngày)
+FORECAST_DAYS  = [1, 3, 7, 14, 30]
 BATCH_SIZE     = 32
 MAX_EPOCHS     = 200
 PATIENCE       = 15
@@ -84,22 +84,12 @@ os.makedirs("results", exist_ok=True)
 # FEATURE COLUMNS — 18 đặc trưng (đồng bộ với 05_integrate.py)
 # ============================================================
 FEATURE_COLS = [
-    "rain_1h", "rain_6h", "rain_24h",
+    "rain_1d", "rain_3d", "rain_7d", "rain_14d",
     "temperature", "humidity",
-    "water_level_lag1", "water_level_lag2", "water_level_lag3",
-    "water_level_lag6", "water_level_lag12",
-    "so_cua_xa", "dang_xa_cua",
-    "Q_out_smooth", "Q_out_lag1", "Q_out_lag6",
-    "Q_out_roll24", "dQout_dt", "xa_dot_ngot",
-]
-
-# Dự phòng nếu chưa chạy bước 7 (thiếu cột Q_out)
-FEATURE_COLS_FALLBACK = [
-    "rain_1h", "rain_6h", "rain_24h",
-    "temperature", "humidity",
-    "water_level_lag1", "water_level_lag2", "water_level_lag3",
-    "water_level_lag6", "water_level_lag12",
-    "so_cua_xa", "dang_xa_cua",
+    "water_level_lag1", "water_level_lag3", "water_level_lag7", "water_level_lag14", "water_level_lag30",
+    "water_level_roll7", "water_level_roll30", "water_level_std7",
+    "month_sin", "month_cos", "season_wet", "season_dry",
+    "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
 ]
 
 TARGET_COL = "water_level_m"
@@ -131,22 +121,16 @@ def validate_and_select_features(
     df_test: pd.DataFrame,
 ) -> tuple:
     """
-    Kiểm tra bộ dữ liệu có đủ 18 features (v2.0+) không.
-    Tự động fallback về 12 features nếu thiếu cột Q_out.
+    Kiểm tra bộ dữ liệu có đủ 21 features (v3.0) không.
     """
-    qout_cols = [c for c in FEATURE_COLS if c not in FEATURE_COLS_FALLBACK]
-    missing   = [c for c in qout_cols if c not in df_train.columns]
-
+    missing = [c for c in FEATURE_COLS if c not in df_train.columns]
     if missing:
-        logger.warning(
-            "Thiếu %d cột Q_out: %s → dùng 12 features (fallback).", len(missing), missing
+        raise KeyError(
+            f"Thiếu {len(missing)} cột đặc trưng trong dataset: {missing}\n"
+            "Hãy chạy lại '05_integrate.py' để tạo đúng bộ dữ liệu."
         )
-        feature_cols = FEATURE_COLS_FALLBACK
-    else:
-        logger.info("✓ Đủ 18 features (v2.0 với Q_out).")
-        feature_cols = FEATURE_COLS
-
-    return df_train, df_val, df_test, feature_cols
+    logger.info("✓ Đủ 21 đặc trưng ngày (v3.0).")
+    return df_train, df_val, df_test, FEATURE_COLS
 
 
 # ============================================================
@@ -341,7 +325,7 @@ def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
 # ============================================================
 def compute_shap_importance(model: Model, X_train: np.ndarray,
                              X_test: np.ndarray, feature_cols: list,
-                             horizon_h: int) -> None:
+                             horizon_d: int) -> None:
     """
     Tính và visualize SHAP values để giải thích mô hình (XAI).
 
@@ -361,13 +345,13 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
         Dữ liệu train (làm background) và test (giải thích).
     feature_cols : list of str
         Tên các features.
-    horizon_h : int
-        Khoảng dự báo (để đặt tên file lưu).
+    horizon_d : int
+        Khoảng dự báo tính bằng ngày (để đặt tên file lưu).
     """
     try:
         import shap
 
-        logger.info("  [SHAP] Tính feature importance cho t+%dh...", horizon_h)
+        logger.info("  [SHAP] Tính feature importance cho t+%dd...", horizon_d)
 
         # Dùng 100 mẫu train làm background (tránh OOM)
         background = X_train[:100]
@@ -391,7 +375,7 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
         sorted_feat = [feature_cols[i] for i in sorted_idx]
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        colors  = ["crimson" if "Q_out" in f or "xa" in f else "steelblue"
+        colors  = ["crimson" if "Q_out" in f or "dH" in f else "steelblue"
                    for f in sorted_feat]
         ax.barh(range(len(sorted_feat)), sorted_vals[::-1],
                 color=colors[::-1], edgecolor="white")
@@ -399,14 +383,14 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
         ax.set_yticklabels(sorted_feat[::-1], fontsize=9)
         ax.set_xlabel("Mean |SHAP value|")
         ax.set_title(
-            f"SHAP Feature Importance — Bi-LSTM+Attention t+{horizon_h}h\n"
-            "(Màu đỏ: features Q_out mới thêm trong v2.0)",
+            f"SHAP Feature Importance — Bi-LSTM+Attention t+{horizon_d}d\n"
+            "(Màu đỏ: features Q_out mới trong v3.0)",
             fontweight="bold",
         )
         ax.grid(axis="x", alpha=0.3)
         plt.tight_layout()
 
-        save_path = f"results/shap_importance_t{horizon_h}h.png"
+        save_path = f"results/shap_importance_t{horizon_d}d.png"
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close()
         logger.info("  [SHAP] Đã lưu: %s", save_path)
@@ -416,12 +400,11 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
             "feature":       sorted_feat,
             "mean_abs_shap": sorted_vals,
         })
-        shap_df.to_csv(f"results/shap_values_t{horizon_h}h.csv", index=False)
+        shap_df.to_csv(f"results/shap_values_t{horizon_d}d.csv", index=False)
 
     except ImportError:
         logger.warning(
-            "[SHAP] Thư viện 'shap' chưa được cài đặt. "
-            "Chạy: pip install shap"
+            "[SHAP] Thư viện 'shap' chưa được cài đặt."
         )
     except Exception as exc:
         logger.warning("[SHAP] Không thể tính SHAP: %s", exc)
@@ -431,14 +414,14 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
 # HUẤN LUYỆN & ĐÁNH GIÁ
 # ============================================================
 def train_and_evaluate(
-    horizon_h: int,
+    horizon_d: int,
     df_train: pd.DataFrame,
     df_val: pd.DataFrame,
     df_test: pd.DataFrame,
     feature_cols: list,
 ) -> tuple:
     """
-    Huấn luyện Bi-LSTM+Attention và đánh giá đầy đủ cho một khoảng dự báo.
+    Huấn luyện Bi-LSTM+Attention và đánh giá đầy đủ cho một khoảng dự báo (ngày).
 
     Quy trình:
       1. Tạo sequences từ dữ liệu đã chuẩn hóa
@@ -454,11 +437,11 @@ def train_and_evaluate(
     tuple
         (metrics_val, metrics_test, trained_model)
     """
-    target_col = f"target_t{horizon_h}h"
-    model_path = f"models/bilstm_t{horizon_h}h.keras"
+    target_col = f"target_t{horizon_d}d"
+    model_path = f"models/bilstm_t{horizon_d}d.keras"
 
     logger.info("=" * 58)
-    logger.info("  HUẤN LUYỆN: t+%dh | %d features | Attention", horizon_h, len(feature_cols))
+    logger.info("  HUẤN LUYỆN: t+%dd | %d features | Attention", horizon_d, len(feature_cols))
     logger.info("=" * 58)
 
     # Kiểm tra cột target
@@ -487,7 +470,7 @@ def train_and_evaluate(
         metrics=["mae"],
     )
 
-    if horizon_h == FORECAST_HOURS[0]:
+    if horizon_d == FORECAST_DAYS[0]:
         model.summary()
 
     # Callbacks
@@ -498,7 +481,7 @@ def train_and_evaluate(
                         save_best_only=True, verbose=0),
         ReduceLROnPlateau(monitor="val_loss", factor=0.5,
                           patience=7, min_lr=1e-6, verbose=1),
-        CSVLogger(f"results/training_log_t{horizon_h}h.csv"),
+        CSVLogger(f"results/training_log_t{horizon_d}d.csv"),
     ]
 
     # Huấn luyện
@@ -522,9 +505,9 @@ def train_and_evaluate(
 
     # Đánh giá
     metrics_val  = evaluate_metrics(y_val, y_pred_val,
-                                    label=f"Val  t+{horizon_h}h")
+                                    label=f"Val  t+{horizon_d}d")
     metrics_test = evaluate_metrics(y_test, y_pred_test_mean,
-                                    label=f"Test t+{horizon_h}h (Yagi)")
+                                    label=f"Test t+{horizon_d}d (Yagi)")
 
     # Lưu kết quả
     df_result = pd.DataFrame({
@@ -535,14 +518,14 @@ def train_and_evaluate(
         "ci95_upper":   y_pred_test_hi,
         "error":        y_pred_test_mean - y_test,
     })
-    df_result.to_csv(f"results/predictions_t{horizon_h}h.csv", index=False)
+    df_result.to_csv(f"results/predictions_t{horizon_d}d.csv", index=False)
 
     # Vẽ biểu đồ
-    plot_results(df_result, history, horizon_h, metrics_test, len(feature_cols))
+    plot_results(df_result, history, horizon_d, metrics_test, len(feature_cols))
 
     # SHAP (cho khoảng dự báo đầu tiên và cuối để tiết kiệm thời gian)
-    if horizon_h in [1, 24]:
-        compute_shap_importance(model, X_train, X_test, feature_cols, horizon_h)
+    if horizon_d in [1, 30]:
+        compute_shap_importance(model, X_train, X_test, feature_cols, horizon_d)
 
     return metrics_val, metrics_test, model
 
@@ -551,7 +534,7 @@ def train_and_evaluate(
 # BIỂU ĐỒ KẾT QUẢ (có khoảng tin cậy MC Dropout)
 # ============================================================
 def plot_results(df_result: pd.DataFrame, history,
-                 horizon_h: int, metrics: dict,
+                 horizon_d: int, metrics: dict,
                  n_features: int) -> None:
     """
     Vẽ 2 biểu đồ:
@@ -561,7 +544,7 @@ def plot_results(df_result: pd.DataFrame, history,
     """
     fig, axes = plt.subplots(2, 1, figsize=(14, 11))
     fig.suptitle(
-        f"Bi-LSTM + Self-Attention | t+{horizon_h}h | {n_features} features\n"
+        f"Bi-LSTM + Self-Attention | t+{horizon_d}d | {n_features} features\n"
         f"RMSE={metrics['rmse']:.4f}m | MAE={metrics['mae']:.4f}m | NSE={metrics['nse']:.4f}",
         fontsize=12, fontweight="bold",
     )
@@ -580,12 +563,12 @@ def plot_results(df_result: pd.DataFrame, history,
         (df_result["timestamp"] >= "2024-09-07")
         & (df_result["timestamp"] <= "2024-09-15")
     )
-    df_plot = df_result[yagi_mask] if yagi_mask.sum() > 10 else df_result.tail(500)
+    df_plot = df_result[yagi_mask] if yagi_mask.sum() >= 2 else df_result.tail(100)
 
     ax2.plot(df_plot["timestamp"], df_plot["actual"],
              label="Thực tế", color="royalblue", linewidth=2)
     ax2.plot(df_plot["timestamp"], df_plot["predicted"],
-             label=f"Dự báo t+{horizon_h}h", color="tomato",
+             label=f"Dự báo t+{horizon_d}d", color="tomato",
              linewidth=1.5, linestyle="--")
 
     # Khoảng tin cậy 95% từ MC Dropout
@@ -595,15 +578,15 @@ def plot_results(df_result: pd.DataFrame, history,
         alpha=0.20, color="tomato", label="Khoảng tin cậy 95% (MC Dropout)",
     )
 
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %Hh"))
-    ax2.xaxis.set_major_locator(mdates.HourLocator(interval=12))
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
+    ax2.xaxis.set_major_locator(mdates.DayLocator(interval=1 if len(df_plot) < 20 else 7))
     plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
     ax2.set_xlabel("Thời gian"); ax2.set_ylabel("Mực nước (m)")
     ax2.set_title("Dự báo vs Thực tế — Lũ Yagi tháng 9/2024\n(Vùng bóng: Khoảng tin cậy 95%)")
     ax2.legend(); ax2.grid(alpha=0.3)
 
     plt.tight_layout()
-    save_path = f"results/plot_t{horizon_h}h.png"
+    save_path = f"results/plot_t{horizon_d}d.png"
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
     logger.info("  [Biểu đồ] Đã lưu: %s", save_path)
@@ -620,19 +603,19 @@ def print_summary_table(all_metrics: dict) -> None:
     print(f"{'Khoảng':>10} | {'RMSE (m)':>10} | {'MAE (m)':>10} | {'NSE':>8} | {'Đánh giá':>10}")
     print("-" * 70)
 
-    for h, (val_m, test_m) in all_metrics.items():
+    for d, (val_m, test_m) in all_metrics.items():
         nse = test_m["nse"]
         tag = "Tốt ✓" if nse >= 0.75 else ("Khá" if nse >= 0.60 else "Yếu ✗")
         print(
-            f"  t+{h:>2}h (Test) | "
+            f"  t+{d:>2}d (Test) | "
             f"{test_m['rmse']:>10.4f} | "
             f"{test_m['mae']:>10.4f} | "
             f"{nse:>8.4f} | {tag:>10}"
         )
     print("=" * 70)
 
-    results_json = {f"t+{h}h": {"val": v, "test": t}
-                    for h, (v, t) in all_metrics.items()}
+    results_json = {f"t+{d}d": {"val": v, "test": t}
+                    for d, (v, t) in all_metrics.items()}
     with open("results/metrics_summary.json", "w", encoding="utf-8") as f:
         json.dump(results_json, f, ensure_ascii=False, indent=2)
     logger.info("Đã lưu: results/metrics_summary.json")
@@ -671,11 +654,11 @@ def main():
 
     # Huấn luyện từng khoảng dự báo
     all_metrics = {}
-    for h in FORECAST_HOURS:
+    for d in FORECAST_DAYS:
         val_m, test_m, _ = train_and_evaluate(
-            h, df_train, df_val, df_test, feature_cols
+            d, df_train, df_val, df_test, feature_cols
         )
-        all_metrics[h] = (val_m, test_m)
+        all_metrics[d] = (val_m, test_m)
 
     print_summary_table(all_metrics)
     logger.info(
