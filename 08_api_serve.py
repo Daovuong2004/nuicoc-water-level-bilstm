@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import joblib
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from keras.models import load_model  # type: ignore
@@ -60,34 +61,37 @@ logger = logging.getLogger("api_serve")
 # ---------------------------------------------------------------------------
 # 18 đặc trưng theo đúng thứ tự đã dùng khi huấn luyện model
 FEATURE_COLS = [
-    "rain_1h",          # Lượng mưa 1 giờ (mm)
-    "rain_6h",          # Lượng mưa tích lũy 6 giờ (mm)
-    "rain_24h",         # Lượng mưa tích lũy 24 giờ (mm)
-    "temperature",      # Nhiệt độ (°C)
-    "humidity",         # Độ ẩm tương đối (%)
-    "water_level_lag1", # Mực nước trễ 1 giờ (m)
-    "water_level_lag2", # Mực nước trễ 2 giờ (m)
-    "water_level_lag3", # Mực nước trễ 3 giờ (m)
-    "water_level_lag6", # Mực nước trễ 6 giờ (m)
-    "water_level_lag12",# Mực nước trễ 12 giờ (m)
-    "so_cua_xa",        # Số cửa xả đang mở
-    "dang_xa_cua",      # Trạng thái đang xả cửa (0/1)
-    "Q_out_smooth",     # Lưu lượng xả làm trơn (m³/s)
-    "Q_out_lag1",       # Lưu lượng xả trễ 1 giờ (m³/s)
-    "Q_out_lag6",       # Lưu lượng xả trễ 6 giờ (m³/s)
-    "Q_out_roll24",     # Trung bình trượt lưu lượng xả 24 giờ (m³/s)
-    "dQout_dt",         # Đạo hàm lưu lượng xả theo thời gian (m³/s²)
-    "xa_dot_ngot",      # Chỉ số xả đột ngột (m³/s)
+    "rain_1d",          # Lượng mưa ngày (mm)
+    "rain_3d",          # Mưa tích lũy 3 ngày (mm)
+    "rain_7d",          # Mưa tích lũy 7 ngày (mm)
+    "rain_14d",         # Mưa tích lũy 14 ngày (mm)
+    "temperature",      # Nhiệt độ trung bình ngày (°C)
+    "humidity",         # Độ ẩm trung bình ngày (%)
+    "water_level_lag1", # Mực nước trễ 1 ngày (m)
+    "water_level_lag3", # Mực nước trễ 3 ngày (m)
+    "water_level_lag7", # Mực nước trễ 7 ngày (m)
+    "water_level_lag14",# Mực nước trễ 14 ngày (m)
+    "water_level_lag30",# Mực nước trễ 30 ngày (m)
+    "water_level_roll7",# Trung bình trượt mực nước 7 ngày (m)
+    "water_level_roll30",# Trung bình trượt mực nước 30 ngày (m)
+    "water_level_std7", # Độ lệch chuẩn mực nước 7 ngày (m)
+    "month_sin",        # Mã hoá tuần hoàn tháng (sin)
+    "month_cos",        # Mã hoá tuần hoàn tháng (cos)
+    "season_wet",       # Mùa mưa (0/1)
+    "season_dry",       # Mùa khô (0/1)
+    "dH_dt_daily",      # Tốc độ biến đổi mực nước ngày (m/ngày)
+    "Q_out_daily",      # Lưu lượng xả ngày ước lượng (m³/s)
+    "Q_out_roll7",      # Trung bình trượt lưu lượng xả 7 ngày (m³/s)
 ]
 
 # Số đặc trưng đầu vào
-FEATURE_COUNT = len(FEATURE_COLS)  # 18
+FEATURE_COUNT = len(FEATURE_COLS)  # 21
 
-# Kích thước cửa sổ thời gian (giờ)
-WINDOW_SIZE = 48
+# Kích thước cửa sổ thời gian (ngày)
+WINDOW_SIZE = 30
 
-# Các chân trời dự báo (giờ)
-FORECAST_HOURS = [1, 3, 6, 12, 24]
+# Các chân trời dự báo (ngày)
+FORECAST_DAYS = [1, 3, 7, 14, 30]
 
 # ---------------------------------------------------------------------------
 # Ngưỡng cảnh báo hồ Núi Cốc (đơn vị: mét)
@@ -100,7 +104,7 @@ NGUY_HIEM = 47.40   # Ngưỡng nguy hiểm — mở toàn bộ cửa xả, sơ 
 # Đường dẫn model và scaler
 # ---------------------------------------------------------------------------
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
-SCALER_PATH = os.path.join(MODEL_DIR, "feature_scaler.pkl")
+SCALER_PATH = os.path.join(MODEL_DIR, "feature_scaler_daily.pkl")
 
 
 # ---------------------------------------------------------------------------
@@ -111,14 +115,14 @@ def load_models_and_scaler() -> tuple[dict, object]:
     Tải toàn bộ model Bi-LSTM+Attention và feature scaler từ thư mục models/.
 
     Quy trình:
-        1. Load scaler (StandardScaler) từ models/feature_scaler.pkl
-        2. Với mỗi chân trời h trong FORECAST_HOURS, load
-           models/bilstm_t{h}h.keras (nếu tồn tại)
+        1. Load scaler (MinMaxScaler) từ models/feature_scaler_daily.pkl
+        2. Với mỗi chân trời d trong FORECAST_DAYS, load
+           models/bilstm_t{d}d.keras (nếu tồn tại)
         3. Model hoặc scaler bị thiếu sẽ bị bỏ qua và ghi log warning
 
     Returns:
-        models_dict (dict): {horizon_h: keras_model}
-        scaler: fitted StandardScaler hoặc None nếu không tìm thấy file
+        models_dict (dict): {horizon_d: keras_model}
+        scaler: fitted MinMaxScaler hoặc None nếu không tìm thấy file
     """
     models_dict = {}
 
@@ -137,21 +141,21 @@ def load_models_and_scaler() -> tuple[dict, object]:
         )
 
     # ---- Tải từng model theo chân trời dự báo ----
-    for h in FORECAST_HOURS:
-        model_path = os.path.join(MODEL_DIR, f"bilstm_t{h}h.keras")
+    for d in FORECAST_DAYS:
+        model_path = os.path.join(MODEL_DIR, f"bilstm_t{d}d.keras")
         if os.path.exists(model_path):
             try:
                 model = load_model(model_path)
-                models_dict[h] = model
-                logger.info("Đã tải model t%dh thành công: %s", h, model_path)
+                models_dict[d] = model
+                logger.info("Đã tải model t%dd thành công: %s", d, model_path)
             except Exception as exc:
                 logger.warning(
-                    "Không thể tải model t%dh từ %s: %s", h, model_path, exc
+                    "Không thể tải model t%dd từ %s: %s", d, model_path, exc
                 )
         else:
             logger.warning(
-                "Không tìm thấy file model t%dh tại %s — bỏ qua chân trời này.",
-                h,
+                "Không tìm thấy file model t%dd tại %s — bỏ qua chân trời này.",
+                d,
                 model_path,
             )
 
@@ -182,7 +186,7 @@ class ForecastRequest(BaseModel):
     Payload đầu vào cho endpoint POST /predict.
 
     Attributes:
-        features:   Ma trận đặc trưng shape (48, 18) — dữ liệu 48 giờ gần nhất.
+        features:   Ma trận đặc trưng shape (30, 21) — dữ liệu 30 ngày gần nhất.
                     Thứ tự cột phải khớp với FEATURE_COLS.
         timestamp:  Thời điểm quan sát cuối cùng (ISO 8601), tùy chọn.
                     Ví dụ: "2026-05-20T14:00:00+07:00"
@@ -190,10 +194,10 @@ class ForecastRequest(BaseModel):
     features: list[list[float]] = Field(
         ...,
         description=(
-            "Ma trận đặc trưng shape (48, 18). "
-            "Hàng = bước thời gian (giờ), Cột = đặc trưng theo thứ tự FEATURE_COLS."
+            "Ma trận đặc trưng shape (30, 21). "
+            "Hàng = bước thời gian (ngày), Cột = đặc trưng theo thứ tự FEATURE_COLS."
         ),
-        example=[[0.0] * 18] * 48,
+        example=[[0.0] * 21] * 30,
     )
     timestamp: str | None = Field(
         default=None,
@@ -204,7 +208,7 @@ class ForecastRequest(BaseModel):
 
 class HorizonForecast(BaseModel):
     """Dự báo mực nước cho một chân trời thời gian cụ thể."""
-    horizon_h: int = Field(..., description="Chân trời dự báo (giờ)")
+    horizon_d: int = Field(..., description="Chân trời dự báo (ngày)")
     water_level_m: float = Field(..., description="Mực nước dự báo trung bình (m)")
     ci95_lower: float = Field(..., description="Cận dưới khoảng tin cậy 95% (m)")
     ci95_upper: float = Field(..., description="Cận trên khoảng tin cậy 95% (m)")
@@ -219,15 +223,15 @@ class ForecastResponse(BaseModel):
         description="Mức cảnh báo: 'BÌNH THƯỜNG' | 'CẢNH BÁO' | 'NGUY HIỂM'",
     )
     alert_message: str = Field(..., description="Thông điệp cảnh báo chi tiết")
-    models_used: list[int] = Field(..., description="Danh sách chân trời đã có model dự báo (giờ)")
+    models_used: list[int] = Field(..., description="Danh sách chân trời đã có model dự báo (ngày)")
 
 
 class HealthResponse(BaseModel):
     """Phản hồi từ endpoint GET /health."""
     status: str = Field(..., description="Trạng thái server: 'ok' hoặc 'degraded'")
-    models_loaded: list[int] = Field(..., description="Chân trời (giờ) đã có model sẵn sàng")
+    models_loaded: list[int] = Field(..., description="Chân trời (ngày) đã có model sẵn sàng")
     feature_count: int = Field(..., description="Số đặc trưng đầu vào")
-    window_size: int = Field(..., description="Kích thước cửa sổ thời gian (giờ)")
+    window_size: int = Field(..., description="Kích thước cửa sổ thời gian (ngày)")
     scaler_loaded: bool = Field(..., description="Scaler đã được tải thành công hay chưa")
 
 
@@ -332,9 +336,9 @@ app = FastAPI(
     description=(
         "API dự báo mực nước hồ Núi Cốc (Thái Nguyên) sử dụng mô hình "
         "Bi-LSTM + Attention với ước lượng bất định Monte Carlo Dropout. "
-        "Hỗ trợ dự báo các chân trời 1h, 3h, 6h, 12h, 24h."
+        "Hỗ trợ dự báo các chân trời 1d, 3d, 7d, 14d, 30d (tần suất Ngày)."
     ),
-    version="2.0",
+    version="3.0",
     contact={
         "name": "Đồ án tốt nghiệp",
         "url": "https://github.com/",
@@ -369,8 +373,8 @@ async def startup_event() -> None:
     response_model=ForecastResponse,
     summary="Dự báo mực nước hồ Núi Cốc",
     description=(
-        "Nhận ma trận đặc trưng 48×18 (48 giờ gần nhất, 18 đặc trưng), "
-        "trả về dự báo mực nước cho các chân trời 1h, 3h, 6h, 12h, 24h "
+        "Nhận ma trận đặc trưng 30×21 (30 ngày gần nhất, 21 đặc trưng ngày), "
+        "trả về dự báo mực nước cho các chân trời 1d, 3d, 7d, 14d, 30d "
         "kèm khoảng tin cậy 95% và mức cảnh báo lũ."
     ),
     tags=["Dự báo"],
@@ -380,9 +384,9 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
     Endpoint dự báo mực nước hồ Núi Cốc.
 
     Quy trình xử lý:
-        1. Kiểm tra shape đầu vào (48, 18)
+        1. Kiểm tra shape đầu vào (30, 21)
         2. Chuẩn hoá đặc trưng bằng feature scaler
-        3. Với mỗi horizon h có model: gọi Monte Carlo Dropout prediction
+        3. Với mỗi horizon d có model: gọi Monte Carlo Dropout prediction
         4. Tính mức cảnh báo dựa trên mực nước dự báo cao nhất
         5. Trả về ForecastResponse đầy đủ
     """
@@ -393,7 +397,7 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
     if scaler is None:
         raise HTTPException(
             status_code=503,
-            detail="Feature scaler chưa được tải. Kiểm tra file models/feature_scaler.pkl.",
+            detail="Feature scaler chưa được tải. Kiểm tra file models/feature_scaler_daily.pkl.",
         )
 
     # ---- Kiểm tra có ít nhất 1 model ----
@@ -403,7 +407,7 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             detail="Chưa có model nào được tải. Kiểm tra thư mục models/.",
         )
 
-    # ---- Validate shape: phải là (48, 18) ----
+    # ---- Validate shape: phải là (30, 21) ----
     features_raw = request.features
     n_rows = len(features_raw)
     if n_rows != WINDOW_SIZE:
@@ -411,7 +415,7 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             status_code=422,
             detail=(
                 f"Số bước thời gian không hợp lệ: nhận được {n_rows}, "
-                f"yêu cầu {WINDOW_SIZE} (48 giờ)."
+                f"yêu cầu {WINDOW_SIZE} (30 ngày)."
             ),
         )
     for i, row in enumerate(features_raw):
@@ -425,32 +429,32 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             )
 
     # ---- Chuyển thành numpy array và chuẩn hoá ----
-    # X_raw: shape (48, 18)
+    # X_raw: shape (30, 21)
     X_raw = np.array(features_raw, dtype=np.float32)
 
     try:
-        # Scaler được fit trên shape (n_samples, 18) — reshape 2D trước khi transform
-        X_scaled = scaler.transform(X_raw)  # shape (48, 18)
+        # Scaler được fit trên shape (n_samples, 21) — reshape 2D trước khi transform
+        X_scaled = scaler.transform(X_raw)  # shape (30, 21)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi chuẩn hoá đặc trưng: {exc}",
         ) from exc
 
-    # Thêm chiều batch: shape (1, 48, 18) để đưa vào model
-    X_input = X_scaled[np.newaxis, ...]  # shape (1, 48, 18)
+    # Thêm chiều batch: shape (1, 30, 21) để đưa vào model
+    X_input = X_scaled[np.newaxis, ...]  # shape (1, 30, 21)
 
     # ---- Dự báo từng chân trời ----
     forecasts: list[HorizonForecast] = []
     models_used: list[int] = []
 
-    for h in FORECAST_HOURS:
-        if h not in models:
+    for d in FORECAST_DAYS:
+        if d not in models:
             # Không có model cho chân trời này — bỏ qua
-            logger.debug("Không có model cho t%dh — bỏ qua.", h)
+            logger.debug("Không có model cho t%dd — bỏ qua.", d)
             continue
 
-        model = models[h]
+        model = models[d]
         try:
             mean_wl, ci_lower, ci_upper = predict_with_mc_dropout(
                 model=model,
@@ -458,24 +462,24 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
                 n_samples=50,
             )
         except Exception as exc:
-            logger.error("Lỗi khi dự báo t%dh: %s", h, exc)
+            logger.error("Lỗi khi dự báo t%dd: %s", d, exc)
             raise HTTPException(
                 status_code=500,
-                detail=f"Lỗi khi dự báo chân trời t{h}h: {exc}",
+                detail=f"Lỗi khi dự báo chân trời t{d}d: {exc}",
             ) from exc
 
         forecasts.append(
             HorizonForecast(
-                horizon_h=h,
+                horizon_d=d,
                 water_level_m=round(mean_wl, 4),
                 ci95_lower=round(ci_lower, 4),
                 ci95_upper=round(ci_upper, 4),
             )
         )
-        models_used.append(h)
+        models_used.append(d)
         logger.info(
-            "t%02dh → mực nước = %.3fm [CI95: %.3f – %.3f]",
-            h, mean_wl, ci_lower, ci_upper,
+            "t%02dd → mực nước = %.3fm [CI95: %.3f – %.3f]",
+            d, mean_wl, ci_lower, ci_upper,
         )
 
     # ---- Tính mức cảnh báo dựa trên mực nước dự báo cao nhất ----
@@ -531,7 +535,7 @@ async def health() -> HealthResponse:
     scaler_loaded = scaler is not None
 
     # Đánh giá trạng thái tổng thể
-    if scaler_loaded and len(models_loaded) == len(FORECAST_HOURS):
+    if scaler_loaded and len(models_loaded) == len(FORECAST_DAYS):
         status = "ok"
     else:
         status = "degraded"

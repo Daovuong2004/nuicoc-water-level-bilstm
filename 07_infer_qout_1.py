@@ -9,12 +9,22 @@ từ phương trình cân bằng nước hồ chứa:
 Đầu ra  : data/final/dataset_with_qout.csv  (thêm 5 cột mới)
 """
 
+import os
+import sys
 import pandas as pd
 import numpy as np
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import os
+
+# Ensure standard output and error output use UTF-8 to prevent UnicodeEncodeError on Windows
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # ============================================================
 # CẤU HÌNH
@@ -298,8 +308,8 @@ def main():
 
     # Load dữ liệu
     print("\n[Load] Đọc dataset_full.csv...")
-    df = pd.read_csv(INPUT_PATH, parse_dates=["timestamp"],
-                     index_col="timestamp")
+    df = pd.read_csv(INPUT_PATH, index_col=0, parse_dates=True)
+    df.index.name = "timestamp"
     print(f"  Tổng: {len(df):,} bản ghi | {df.index.min()} → {df.index.max()}")
 
     # Bước 1: Suy luận Q_out
