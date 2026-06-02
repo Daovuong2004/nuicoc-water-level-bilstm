@@ -6,8 +6,8 @@ Thứ tự thực thi:
   Bước 2 : Xử lý GEE Sentinel-2 → mực nước qua đường cong A-H
   Bước 3+4: Trích xuất sự kiện lũ + vận hành cửa xả từ báo chí
   Bước 5 : Tích hợp dữ liệu (Kalman Filter, Q_out, chuẩn hóa, chia split)
-  Bước 6 : Huấn luyện Bi-LSTM + Self-Attention + MC Dropout + SHAP
-  Bước 6b: Ablation Study — so sánh SARIMA / LSTM / Bi-LSTM / Bi-LSTM+Attn
+  Bước 6 : Huấn luyện Bi-LSTM + MC Dropout + SHAP
+  Bước 6b: Ablation Study — so sánh SARIMA / LSTM / GRU / Bi-LSTM
   Bước 7 : Phân tích Q_out và phát hiện xả đột ngột (tùy chọn)
   Bước 8 : Khởi động FastAPI Inference Server (tùy chọn)
 
@@ -99,7 +99,7 @@ def run_step(script: str, step_name: str,
 def main():
     print("=" * 62)
     print("  PIPELINE DỰ BÁO MỰC NƯỚC HỒ NÚI CỐC")
-    print("  Mô hình: Bi-LSTM + Self-Attention (v3.0)")
+    print("  Mô hình: Bi-LSTM (v4.0)")
     print(f"  Bắt đầu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 62)
 
@@ -131,12 +131,12 @@ def main():
          False),
 
         ("06_bilstm_model.py",
-         "Bước 6: Huấn luyện Bi-LSTM + Self-Attention + MC Dropout + SHAP",
+         "Bước 6: Huấn luyện Bi-LSTM + MC Dropout + SHAP",
          False),
 
         # --- Tùy chọn (chạy thêm nếu có thể) ---
         ("06b_baseline_comparison.py",
-         "Bước 6b: Ablation Study — SARIMA vs LSTM vs Bi-LSTM vs Bi-LSTM+Attn",
+         "Bước 6b: Ablation Study — SARIMA vs LSTM vs GRU vs Bi-LSTM",
          True),
 
         ("07_infer_qout_1.py",
@@ -162,7 +162,7 @@ def main():
 
     print(f"\n{'='*62}")
     print("  OUTPUT:")
-    print("    models/bilstm_t*.keras       ← Mô hình Bi-LSTM+Attention")
+    print("    models/bilstm_t*.keras       ← Mô hình Bi-LSTM")
     print("    models/feature_scaler.pkl    ← Scaler chuẩn hóa")
     print("    results/plot_t*.png          ← Biểu đồ dự báo + CI95%")
     print("    results/shap_importance_*.png← SHAP Feature Importance")
