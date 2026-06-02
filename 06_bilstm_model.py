@@ -188,8 +188,8 @@ def build_bilstm(input_shape: tuple, lstm_units: list,
       mùa mưa/khô của hồ chứa.
 
     Kiến trúc:
-      BiLSTM(256) → Dropout(0.25) → BatchNorm
-      → BiLSTM(128) → Dropout(0.25) → BatchNorm
+      BiLSTM(256) → Dropout(0.25)
+      → BiLSTM(128) → Dropout(0.25)
       → Dense(64, relu, L2) → Dense(32, relu) → Dense(1, linear)
 
     Parameters
@@ -199,7 +199,7 @@ def build_bilstm(input_shape: tuple, lstm_units: list,
     lstm_units : list of int
         Số unit LSTM lớp 1 và 2.
     dropout_rate : float
-        Tỉ lệ Dropout (dùng cả trong MC Dropout inference).
+        Tỉ lệ Dropout.
 
     Returns
     -------
@@ -213,7 +213,6 @@ def build_bilstm(input_shape: tuple, lstm_units: list,
         name="bidirectional_1",
     )(inputs)
     x = Dropout(dropout_rate, name="dropout_1")(x)
-    x = BatchNormalization(name="bn_1")(x)
 
     # ── Lớp BiLSTM 2: tổng hợp thành vector cố định ─────────────────
     x = Bidirectional(
@@ -221,7 +220,6 @@ def build_bilstm(input_shape: tuple, lstm_units: list,
         name="bidirectional_2",
     )(x)
     x = Dropout(dropout_rate, name="dropout_2")(x)
-    x = BatchNormalization(name="bn_2")(x)
 
     # ── Lớp Dense: ánh xạ sang không gian dự báo ──────────────────
     x       = Dense(64, activation="relu", kernel_regularizer=l2(L2_REG),
@@ -248,11 +246,6 @@ def predict_with_mc_dropout(
       Thông thường, inference tắt Dropout (training=False).
       MC Dropout BẬT Dropout cả trong inference (training=True),
       chạy N lần → N dự báo khác nhau → phân phối xấp xỉ posterior.
-
-    Ý nghĩa thực tiễn trong thủy văn:
-      Thay vì nói "mực nước t+6h là 46.5m", mô hình nói:
-      "46.5m ± 0.3m (95% CI)" — thông tin quan trọng hơn nhiều
-      cho đơn vị vận hành hồ chứa trong quyết định xả cửa.
 
     Parameters
     ----------
@@ -378,8 +371,8 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
         ax.set_yticklabels(sorted_feat[::-1], fontsize=9)
         ax.set_xlabel("Mean |SHAP value|")
         ax.set_title(
-            f"SHAP Feature Importance — Bi-LSTM+Attention t+{horizon_d}d\n"
-            "(Màu đỏ: features Q_out mới trong v3.0)",
+            f"SHAP Feature Importance — Bi-LSTM t+{horizon_d}d\n"
+            "(Màu đỏ: features Q_out mới)",
             fontweight="bold",
         )
         ax.grid(axis="x", alpha=0.3)
@@ -416,11 +409,11 @@ def train_and_evaluate(
     feature_cols: list,
 ) -> tuple:
     """
-    Huấn luyện Bi-LSTM+Attention và đánh giá đầy đủ cho một khoảng dự báo (ngày).
+    Huấn luyện Bi-LSTM và đánh giá đầy đủ cho một khoảng dự báo (ngày).
 
     Quy trình:
       1. Tạo sequences từ dữ liệu đã chuẩn hóa
-      2. Build model Bi-LSTM+Attention
+      2. Build model Bi-LSTM
       3. Train với EarlyStopping + ReduceLROnPlateau
       4. Đánh giá trên val và test (lũ Yagi 2024)
       5. Dự báo với MC Dropout → khoảng tin cậy 95%
@@ -436,7 +429,7 @@ def train_and_evaluate(
     model_path = f"models/bilstm_t{horizon_d}d.keras"
 
     logger.info("=" * 58)
-    logger.info("  HUẤN LUYỆN: t+%dd | %d features | Attention", horizon_d, len(feature_cols))
+    logger.info("  HUẤN LUYỆN: t+%dd | %d features | Bi-LSTM", horizon_d, len(feature_cols))
     logger.info("=" * 58)
 
     # Kiểm tra cột target
@@ -455,6 +448,19 @@ def train_and_evaluate(
     X_test,  y_test,  ts_test  = create_sequences(df_test,  feature_cols, target_col, WINDOW_SIZE)
     logger.info("  Train: %s | Val (EarlyStopping): %s | Test (Bao cao): %s",
                 X_train.shape, X_val.shape, X_test.shape)
+
+    import joblib
+    from sklearn.preprocessing import MinMaxScaler
+
+    # Chuẩn hóa biến mục tiêu (Target Scaling) để tăng hiệu quả hội tụ
+    target_scaler = MinMaxScaler()
+    y_train_scaled = target_scaler.fit_transform(y_train.reshape(-1, 1)).flatten()
+    y_val_scaled = target_scaler.transform(y_val.reshape(-1, 1)).flatten()
+
+    # Lưu target scaler phục vụ API
+    scaler_path = f"models/target_scaler_t{horizon_d}d.pkl"
+    joblib.dump(target_scaler, scaler_path)
+    logger.info("  [Scaler] Đã lưu target scaler: %s", scaler_path)
 
     # Build model Bi-LSTM thuần túy
     model = build_bilstm(
@@ -482,29 +488,49 @@ def train_and_evaluate(
         CSVLogger(f"results/training_log_t{horizon_d}d.csv"),
     ]
 
-    # Huấn luyện
+    # Huấn luyện trên target đã chuẩn hóa
     history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
+        X_train, y_train_scaled,
+        validation_data=(X_val, y_val_scaled),
         epochs=MAX_EPOCHS,
         batch_size=BATCH_SIZE,
         callbacks=callbacks,
         verbose=1,
     )
 
-    # ── Dự báo trung bình (deterministic) ────────────────────
-    y_pred_val  = model.predict(X_val,  verbose=0).flatten()
+    # ── Dự báo tất định (deterministic) ────────────────────
+    y_pred_val_scaled = model.predict(X_val, verbose=0).flatten()
+    y_pred_val = target_scaler.inverse_transform(y_pred_val_scaled.reshape(-1, 1)).flatten()
 
-    # ── Du bao xac suat voi MC Dropout (Test set) ────────────────────
+    y_pred_test_det_scaled = model.predict(X_test, verbose=0).flatten()
+    y_pred_test_det = target_scaler.inverse_transform(y_pred_test_det_scaled.reshape(-1, 1)).flatten()
+
+    # ── Dự báo khoảng tin cậy với MC Dropout (Test set) ────────────────────
     logger.info("  [MC Dropout] Chay %d mau de uoc luong khoang tin cay...", MC_SAMPLES)
-    y_pred_test_mean, y_pred_test_lo, y_pred_test_hi = predict_with_mc_dropout(
-        model, X_test, n_samples=MC_SAMPLES
-    )
+    # Lấy các mẫu dự báo dạng scaled
+    mc_preds_scaled = np.stack([
+        model(X_test, training=True).numpy().flatten()
+        for _ in range(MC_SAMPLES)
+    ], axis=0)  # shape: (MC_SAMPLES, n_data)
 
-    # Danh gia:
-    #   metrics_val  -> chi dung de theo doi overfitting (khong bao cao)
-    #   metrics_test -> KET QUA BAO CAO chinh trong luan van
-    metrics_val  = evaluate_metrics(y_val, model.predict(X_val, verbose=0).flatten(),
+    # Nghịch đảo chuẩn hóa từng mẫu về mét
+    mc_preds_meters = np.stack([
+        target_scaler.inverse_transform(mc_preds_scaled[i].reshape(-1, 1)).flatten()
+        for i in range(MC_SAMPLES)
+    ], axis=0)  # shape: (MC_SAMPLES, n_data)
+
+    # Tính độ lệch chuẩn trên đơn vị mét
+    std_pred_meters = mc_preds_meters.std(axis=0)
+
+    # Điểm dự báo chính (Point Forecast) là dự báo tất định (deterministic) để tối ưu NSE
+    y_pred_test_mean = y_pred_test_det
+
+    # Khoảng tin cậy 95% đối xứng quanh điểm dự báo tất định
+    y_pred_test_lo = y_pred_test_mean - 1.96 * std_pred_meters
+    y_pred_test_hi = y_pred_test_mean + 1.96 * std_pred_meters
+
+    # Danh gia trên đơn vị mét:
+    metrics_val  = evaluate_metrics(y_val, y_pred_val,
                                     label=f"Val  (EarlyStopping) t+{horizon_d}d")
     metrics_test = evaluate_metrics(y_test, y_pred_test_mean,
                                     label=f"Test (Kiem dinh doc lap) t+{horizon_d}d")
@@ -544,7 +570,7 @@ def plot_results(df_result: pd.DataFrame, history,
     """
     fig, axes = plt.subplots(2, 1, figsize=(14, 11))
     fig.suptitle(
-        f"Bi-LSTM + Self-Attention | t+{horizon_d}d | {n_features} features\n"
+        f"Bi-LSTM | t+{horizon_d}d | {n_features} features\n"
         f"RMSE={metrics['rmse']:.4f}m | MAE={metrics['mae']:.4f}m | NSE={metrics['nse']:.4f}",
         fontsize=12, fontweight="bold",
     )
@@ -602,7 +628,7 @@ def print_summary_table(all_metrics: dict) -> None:
     Chi so Val chi hien thi de tham khao kiem tra overfitting.
     """
     print("\n" + "=" * 74)
-    print("  BANG TONG HOP — Bi-LSTM + Self-Attention (Ho Nui Coc)")
+    print("  BANG TONG HOP — Bi-LSTM (Ho Nui Coc)")
     print("  [BAO CAO CHINH: Test 2024-2025 — bao gom lu Yagi 9/2024]")
     print("=" * 74)
     print(f"{'Khoang':>10} | {'RMSE (m)':>10} | {'MAE (m)':>10} | {'NSE':>8} | {'Danh gia':>10}")
@@ -634,7 +660,7 @@ def print_summary_table(all_metrics: dict) -> None:
 # ============================================================
 def main():
     logger.info("=" * 60)
-    logger.info("BƯỚC 6: HUẤN LUYỆN Bi-LSTM + SELF-ATTENTION (v3.0)")
+    logger.info("BƯỚC 6: HUẤN LUYỆN Bi-LSTM (v4.0)")
     logger.info("Thời gian: %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
     logger.info("=" * 60)
 
