@@ -37,6 +37,7 @@
 # ── PHÁT HIỆN MÔI TRƯỜNG CHẠY ────────────────────────────────
 # IS_COLAB = True  : đang chạy trong Google Colab → mount Drive, dùng GEE
 # IS_COLAB = False : đang mở trong IDE local (VS Code, PyCharm...) → skip
+from pandas._config import display
 try:
     import google.colab  # noqa: F401
     IS_COLAB = True
@@ -123,8 +124,10 @@ END_YEAR   = 2025
 # sẽ loại từng pixel mây trước khi tính NDWI → kết quả vẫn chính xác.
 MAX_CLOUD_PCT = 80
 
-# ── NGƯỠNG NDWI ───────────────────────────────────────────────
-NDWI_THRESHOLD = 0.0   # McFeeters (1996): NDWI > 0 → mặt nước
+# ── NGƯỠNG WATER INDEX ────────────────────────────────────────
+# Sử dụng MNDWI thay cho NDWI (nước đục làm nhiễu NDWI).
+# Ngưỡng -0.05 giúp bắt chính xác mặt hồ kể cả khi nhiều phù sa lơ lửng.
+WATER_THRESHOLD = -0.05
 
 # ── BOUNDING BOX HỒ NÚI CỐC (WGS84) ──────────────────────────
 LAKE_BOUNDS = {
@@ -173,7 +176,7 @@ ah_to_level = interp1d(_areas, _levels, kind="linear",
 print("✓ Cấu hình hoàn tất.")
 print(f"  Giai đoạn  : {START_YEAR} – {END_YEAR}")
 print(f"  Ngưỡng mây : < {MAX_CLOUD_PCT}%  (QA60 mask)")
-print(f"  NDWI > {NDWI_THRESHOLD}")
+print(f"  MNDWI > {WATER_THRESHOLD}")
 print(f"  Export → Drive folder: '{GEE_EXPORT_FOLDER}'")
 
 
@@ -222,11 +225,14 @@ def compute_water_area(image):
     # Bước 1: Áp QA60 cloud mask
     img_clean = mask_clouds_qa60(image)
 
-    # Bước 2: NDWI = (Green B3 - NIR B8) / (Green B3 + NIR B8)
-    ndwi = img_clean.normalizedDifference(["B3", "B8"]).rename("NDWI")
+    # Bước 2: Thay NDWI bằng MNDWI = (Green B3 - SWIR B11) / (Green B3 + SWIR B11)
+    # Hồ Núi Cốc vào mùa mưa bị đục (phù sa lơ lửng). 
+    # Băng tần NIR (B8) bị phản xạ bởi bùn đất, làm NDWI bị sai.
+    # Băng tần SWIR (B11) bị nước hấp thụ mạnh bất kể đục trong.
+    mndwi = img_clean.normalizedDifference(["B3", "B11"]).rename("WATER_INDEX")
 
     # Bước 3: Phân loại pixel mặt nước
-    water = ndwi.gt(NDWI_THRESHOLD)
+    water = mndwi.gt(WATER_THRESHOLD)
 
     # Bước 4: Tính diện tích (1 reduceRegion duy nhất)
     # pixel_area (m²) × water_mask → tổng m² mặt nước → ÷ 10000 → ha
@@ -235,14 +241,14 @@ def compute_water_area(image):
     stats = area_image.reduceRegion(
         reducer=ee.Reducer.sum(),
         geometry=REGION,
-        scale=10,            # Độ phân giải Sentinel-2 Band 3, 8 = 10m
+        scale=20,            # B11 của Sentinel-2 có độ phân giải 20m (tối ưu quota)
         maxPixels=1e13,      # Đặt lớn để tránh lỗi "too many pixels"
         bestEffort=True,     # Tự tăng scale nếu vượt maxPixels
     )
 
     return ee.Feature(None, {
         "date":          ee.Date(image.get("system:time_start")).format("YYYY-MM-dd"),
-        "water_area_ha": stats.get("NDWI"),
+        "water_area_ha": stats.get("WATER_INDEX"),
         "cloud_scene":   image.get("CLOUDY_PIXEL_PERCENTAGE"),
         "img_id":        image.id(),
     })
@@ -295,7 +301,7 @@ def start_export_task(year: int, description: str = None) -> object:
         .filterBounds(REGION)
         .filterDate(f"{year}-01-01", f"{year}-12-31")
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", MAX_CLOUD_PCT))
-        .select(["B3", "B8", "QA60"])
+        .select(["B3", "B8", "B11", "QA60"])
     )
 
     # Ánh xạ hàm tính diện tích → FeatureCollection
@@ -589,7 +595,7 @@ print(f"  Giai đoạn: {df_final['date'].min().date()} → {df_final['date'].ma
 fig, axes = plt.subplots(2, 1, figsize=(15, 9))
 fig.suptitle(
     f"Mực nước hồ Núi Cốc — GEE Sentinel-2 | {START_YEAR}–{END_YEAR}\n"
-    f"QA60 mask | Mây < {MAX_CLOUD_PCT}% | NDWI > {NDWI_THRESHOLD} | "
+    f"QA60 mask | Mây < {MAX_CLOUD_PCT}% | MNDWI > {WATER_THRESHOLD} | "
     f"Đường cong A-H",
     fontsize=12, fontweight="bold",
 )
