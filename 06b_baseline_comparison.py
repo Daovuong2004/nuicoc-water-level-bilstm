@@ -2,14 +2,14 @@
 Bước 6b: Ablation Study / Baseline Comparison
 ==============================================
 Mục đích:
-    So sánh 4 mô hình để chứng minh rằng Bi-LSTM + Attention là kiến trúc
-    tốt nhất cho bài toán dự báo mực nước hồ Núi Cốc, Thái Nguyên.
+    So sánh 4 mô hình để chứng minh hiệu quả của mô hình đề xuất Bi-LSTM
+    cho bài toán dự báo mực nước hồ Núi Cốc, Thái Nguyên.
 
 Bốn mô hình được so sánh:
     1. SARIMA        — mô hình thống kê truyền thống (baseline thống kê)
     2. LSTM          — LSTM đơn chiều (baseline học sâu, không BiDir)
-    3. Bi-LSTM       — Bi-LSTM không có Attention (baseline loại bỏ Attn)
-    4. Bi-LSTM+Attn  — Mô hình đề xuất (đã huấn luyện tại bước 06)
+    3. GRU           — GRU đơn chiều (baseline học sâu cải tiến)
+    4. Bi-LSTM       — Mô hình đề xuất (đã huấn luyện tại bước 06)
 
 Các chỉ số đánh giá:
     - RMSE  (Root Mean Squared Error)  : đơn vị mét
@@ -85,7 +85,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CẤU HÌNH SIÊU THAM SỐ
 # ============================================================
-WINDOW_SIZE    = 30           # Số ngày nhìn lại (input sequence length)
+WINDOW_SIZE    = 60           # Số ngày nhìn lại (input sequence length) — đồng bộ 60 ngày
 FORECAST_DAYS  = [1, 3, 7, 14, 30]   # Các khoảng dự báo (ngày)
 BATCH_SIZE     = 32
 MAX_EPOCHS     = 200
@@ -101,21 +101,30 @@ os.makedirs("models",  exist_ok=True)
 os.makedirs("results", exist_ok=True)
 
 # ============================================================
-# FEATURE COLUMNS
+# FEATURE COLUMNS (26 đặc trưng — v4.0 Daily đồng bộ với 05_integrate.py)
 # ============================================================
 FEATURE_COLS = [
-    "rain_1d", "rain_3d", "rain_7d", "rain_14d",
+    # Khí tượng (7 features)
+    "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
     "temperature", "humidity",
-    "water_level_lag1", "water_level_lag3", "water_level_lag7", "water_level_lag14", "water_level_lag30",
-    "water_level_roll7", "water_level_roll30", "water_level_std7",
+    # Lag mực nước (6 features)
+    "water_level_lag1", "water_level_lag3", "water_level_lag7",
+    "water_level_lag14", "water_level_lag30", "water_level_lag60",
+    # Rolling stats (4 features)
+    "water_level_roll7", "water_level_roll30", "water_level_roll60",
+    "water_level_std7",
+    # Temporal (4 features)
     "month_sin", "month_cos", "season_wet", "season_dry",
+    # Xu hướng thủy văn (2 features)
+    "delta_h_7d", "delta_h_30d",
+    # Q_out (3 features)
     "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
 ]
 
 TARGET_COL = "water_level_m"   # Cột mực nước thực tế (m)
 
 # Tên hiển thị và màu sắc cho từng mô hình trong biểu đồ
-MODEL_NAMES  = ["SARIMA", "LSTM", "Bi-LSTM", "Bi-LSTM+Attn"]
+MODEL_NAMES  = ["SARIMA", "LSTM", "GRU", "Bi-LSTM"]
 MODEL_COLORS = ["#808080", "steelblue", "orange", "crimson"]
 
 
@@ -332,56 +341,45 @@ def build_lstm_unidirectional(input_shape: tuple) -> Model:
     return model
 
 
-def build_bilstm_simple(input_shape: tuple) -> Model:
+def build_gru_unidirectional(input_shape: tuple) -> Model:
     """
-    Bi-LSTM đơn giản — không có Attention (baseline loại bỏ Attention).
+    GRU đơn chiều — Baseline học sâu để so sánh với Bi-LSTM.
 
-    Kiến trúc (giống kiến trúc gốc trong 06_bilstm_model.py):
+    Kiến trúc:
         Input(window_size, n_features)
-        → Bidirectional(LSTM(128, return_sequences=True))
-        → Dropout(0.2) → BatchNormalization
-        → Bidirectional(LSTM(64, return_sequences=False))
-        → Dropout(0.2) → BatchNormalization
+        → GRU(128, return_sequences=True)
+        → Dropout(0.2)
+        → GRU(64, return_sequences=False)
+        → Dropout(0.2)
         → Dense(32, relu)
         → Dense(1, linear)   ← Dự báo mực nước (m)
-
-    Lý do so sánh:
-        Để tách biệt đóng góp của cơ chế Attention so với phần Bi-LSTM cơ bản.
-        Nếu Bi-LSTM+Attn >> Bi-LSTM đơn giản → Attention có giá trị.
 
     Parameters
     ----------
     input_shape : tuple
-        (window_size, n_features) — có thể là 12 hoặc 18 features.
+        (window_size, n_features)
 
     Returns
     -------
     keras.Model
         Mô hình đã được compile với Adam optimizer, loss=MSE.
     """
+    from keras.layers import GRU
     inputs = Input(shape=input_shape, name="input_sequence")
 
-    # Lớp BiLSTM thứ nhất — học đặc trưng từ cả 2 chiều thời gian
-    x = Bidirectional(
-        LSTM(128, return_sequences=True, name="bilstm_1"),
-        name="bidirectional_1",
-    )(inputs)
+    # Lớp GRU thứ nhất — trích xuất đặc trưng chuỗi
+    x = GRU(128, return_sequences=True, name="gru_1")(inputs)
     x = Dropout(0.2, name="dropout_1")(x)
-    x = BatchNormalization(name="bn_1")(x)
 
-    # Lớp BiLSTM thứ hai — tổng hợp biểu diễn chuỗi
-    x = Bidirectional(
-        LSTM(64, return_sequences=False, name="bilstm_2"),
-        name="bidirectional_2",
-    )(x)
+    # Lớp GRU thứ hai — tổng hợp thông tin thành vector cố định
+    x = GRU(64, return_sequences=False, name="gru_2")(x)
     x = Dropout(0.2, name="dropout_2")(x)
-    x = BatchNormalization(name="bn_2")(x)
 
     # Lớp Dense — ánh xạ sang không gian dự báo
     x       = Dense(32, activation="relu", name="dense_1")(x)
     outputs = Dense(1,  activation="linear", name="output")(x)
 
-    model = Model(inputs=inputs, outputs=outputs, name="BiLSTM_Simple")
+    model = Model(inputs=inputs, outputs=outputs, name="GRU_Unidirectional")
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         loss="mse",
@@ -835,12 +833,12 @@ def main() -> None:
 
     Luồng thực thi:
         1. Load df_train, df_val, df_test từ data/final/
-        2. Kiểm tra feature set (18 cols hoặc fallback 12 cols)
-        3. Loop qua FORECAST_HOURS [1, 3, 6, 12, 24]:
+        2. Kiểm tra feature set (26 cột)
+        3. Loop qua FORECAST_DAYS [1, 3, 7, 14, 30]:
             a. SARIMA rolling forecast
-            b. LSTM đơn chiều (train từ đầu)
-            c. Bi-LSTM đơn giản (train từ đầu)
-            d. Load Bi-LSTM+Attention từ models/bilstm_t{h}h.keras
+            b. LSTM đơn chiều (train từ đầu với target scaling)
+            c. GRU đơn chiều (train từ đầu với target scaling)
+            d. Load Bi-LSTM đề xuất từ models/bilstm_t{h}d.keras và nghịch đảo chuẩn hóa
         4. Tổng hợp kết quả → dict all_results
         5. Vẽ biểu đồ so sánh → plot_comparison_table()
         6. Lưu JSON + in bảng → save_results_json()
@@ -944,6 +942,12 @@ def main() -> None:
             logger.warning("  [SARIMA] Bỏ qua t+%dd.", h)
             all_results[h]["SARIMA"] = None
 
+        # Chuẩn hóa Target cho các baseline
+        from sklearn.preprocessing import MinMaxScaler
+        target_scaler = MinMaxScaler()
+        y_train_scaled = target_scaler.fit_transform(y_train.reshape(-1, 1)).flatten()
+        y_val_scaled = target_scaler.transform(y_val.reshape(-1, 1)).flatten()
+
         # ── 3b. LSTM đơn chiều ──────────────────────────────────
         logger.info("\n  → [2/4] LSTM đơn chiều...")
         lstm_model = build_lstm_unidirectional(
@@ -951,58 +955,71 @@ def main() -> None:
         )
         train_keras_model(
             model=lstm_model,
-            X_train=X_train, y_train=y_train,
-            X_val=X_val,     y_val=y_val,
+            X_train=X_train, y_train=y_train_scaled,
+            X_val=X_val,     y_val=y_val_scaled,
             model_name="lstm_uni",
             horizon_d=h,
         )
-        y_pred_lstm = lstm_model.predict(X_test, verbose=0).flatten()
+        y_pred_lstm_scaled = lstm_model.predict(X_test, verbose=0).flatten()
+        y_pred_lstm = target_scaler.inverse_transform(y_pred_lstm_scaled.reshape(-1, 1)).flatten()
         all_results[h]["LSTM"] = evaluate_metrics(
             y_test, y_pred_lstm, label=f"LSTM t+{h}d"
         )
 
-        # ── 3c. Bi-LSTM đơn giản (không Attention) ─────────────
-        logger.info("\n  → [3/4] Bi-LSTM đơn giản (không Attention)...")
-        bilstm_model = build_bilstm_simple(
+        # ── 3c. GRU đơn chiều ─────────────────────────────
+        logger.info("\n  → [3/4] GRU đơn chiều...")
+        gru_model = build_gru_unidirectional(
             input_shape=(WINDOW_SIZE, n_features)
         )
         train_keras_model(
-            model=bilstm_model,
-            X_train=X_train, y_train=y_train,
-            X_val=X_val,     y_val=y_val,
-            model_name="bilstm_simple",
+            model=gru_model,
+            X_train=X_train, y_train=y_train_scaled,
+            X_val=X_val,     y_val=y_val_scaled,
+            model_name="gru_uni",
             horizon_d=h,
         )
-        y_pred_bilstm = bilstm_model.predict(X_test, verbose=0).flatten()
-        all_results[h]["Bi-LSTM"] = evaluate_metrics(
-            y_test, y_pred_bilstm, label=f"Bi-LSTM t+{h}d"
+        y_pred_gru_scaled = gru_model.predict(X_test, verbose=0).flatten()
+        y_pred_gru = target_scaler.inverse_transform(y_pred_gru_scaled.reshape(-1, 1)).flatten()
+        all_results[h]["GRU"] = evaluate_metrics(
+            y_test, y_pred_gru, label=f"GRU t+{h}d"
         )
 
-        # ── 3d. Bi-LSTM + Attention (load từ bước 06) ──────────
-        attn_model_path = f"models/bilstm_t{h}d.keras"
-        logger.info("\n  → [4/4] Bi-LSTM+Attention — load từ: %s", attn_model_path)
+        # ── 3d. Bi-LSTM (Đề xuất, load từ bước 06) ──────────
+        bilstm_model_path = f"models/bilstm_t{h}d.keras"
+        logger.info("\n  → [4/4] Bi-LSTM (Đề xuất) — load từ: %s", bilstm_model_path)
 
-        if not os.path.exists(attn_model_path):
+        if not os.path.exists(bilstm_model_path):
             logger.warning(
                 "  CẢNH BÁO: Chưa tìm thấy '%s'.\n"
                 "  → Hãy chạy '06_bilstm_model.py' trước để huấn luyện.\n"
-                "  → Bỏ qua Bi-LSTM+Attn cho t+%dd.",
-                attn_model_path, h,
+                "  → Bỏ qua Bi-LSTM cho t+%dd.",
+                bilstm_model_path, h,
             )
-            all_results[h]["Bi-LSTM+Attn"] = None
+            all_results[h]["Bi-LSTM"] = None
         else:
             try:
-                attn_model  = load_model(attn_model_path)
-                y_pred_attn = attn_model.predict(X_test, verbose=0).flatten()
-                all_results[h]["Bi-LSTM+Attn"] = evaluate_metrics(
-                    y_test, y_pred_attn, label=f"Bi-LSTM+Attn t+{h}d"
+                bilstm_model  = load_model(bilstm_model_path)
+                y_pred_bilstm_scaled = bilstm_model.predict(X_test, verbose=0).flatten()
+                
+                # Nạp target scaler tương ứng từ bước 06 để nghịch đảo chuẩn hóa
+                import joblib
+                horizon_scaler_path = f"models/target_scaler_t{h}d.pkl"
+                if os.path.exists(horizon_scaler_path):
+                    h_scaler = joblib.load(horizon_scaler_path)
+                    y_pred_bilstm = h_scaler.inverse_transform(y_pred_bilstm_scaled.reshape(-1, 1)).flatten()
+                else:
+                    logger.warning("  Không tìm thấy target scaler cho t+%dd → dùng scaler hiện tại", h)
+                    y_pred_bilstm = target_scaler.inverse_transform(y_pred_bilstm_scaled.reshape(-1, 1)).flatten()
+                    
+                all_results[h]["Bi-LSTM"] = evaluate_metrics(
+                    y_test, y_pred_bilstm, label=f"Bi-LSTM t+{h}d"
                 )
             except Exception as exc:
                 logger.error(
                     "  Lỗi khi load/predict '%s': %s — Bỏ qua.",
-                    attn_model_path, exc,
+                    bilstm_model_path, exc,
                 )
-                all_results[h]["Bi-LSTM+Attn"] = None
+                all_results[h]["Bi-LSTM"] = None
 
     # ── 4. Tổng hợp và xuất kết quả ───────────────────────────
     logger.info("\n%s", "=" * 65)
