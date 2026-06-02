@@ -45,22 +45,20 @@ Dinh dang: [Semantic Versioning](https://semver.org/)
 ## [2.0.0] — 2026-05-10
 
 ### Added
-- **Multi-Head Self-Attention** (4 heads, key_dim=32) sau lop BiLSTM dau tien
-  - Residual connection + LayerNorm theo kien truc Transformer
-  - Giai quyet van de long-range dependency trong chuoi thoi gian muc nuoc
-- **Monte Carlo Dropout** (50 samples) de uoc luong khoang tin cay 95%
-  - Thay vi noi "muc nuoc t+6h la 46.5m", mo hinh noi "46.5m ± 0.3m (95% CI)"
-- **SHAP Feature Importance** (GradientExplainer) — giai thich mo hinh (XAI)
-  - Tinh cho t+1d va t+30d de tiet kiem thoi gian
-- **06b_baseline_comparison.py**: ablation study so sanh 4 mo hinh
-  - SARIMA | LSTM | Bi-LSTM | Bi-LSTM+Attention
-- **08_api_serve.py**: FastAPI server voi endpoint /predict, /health, /features, /thresholds
-- **run_all.py**: chay toan bo pipeline mot lenh
-- Q_out features moi: `Q_out_smooth`, `Q_out_lag1/6`, `Q_out_roll24`, `dQout_dt`, `xa_dot_ngot`
+- **Bi-LSTM nâng cao** với siêu tham số tối ưu (dropout, L2 regularization) thay thế LSTM đơn giản
+- **Monte Carlo Dropout** (50 samples) để ước lượng khoảng tin cậy 95%
+  - Thay vì nói "mực nước t+7d là 46.5m", mô hình nói "46.5m ± 0.3m (95% CI)"
+- **SHAP Feature Importance** (GradientExplainer) — giải thích mô hình (XAI)
+  - Tính cho t+1d và t+30d để tiết kiệm thời gian
+- **06b_baseline_comparison.py**: ablation study so sánh 4 mô hình
+  - SARIMA | LSTM | GRU | Bi-LSTM
+- **08_api_serve.py**: FastAPI server với endpoint /predict, /health, /features, /thresholds
+- **run_all.py**: chạy toàn bộ pipeline một lệnh
+- Q_out features mới: `Q_out_smooth`, `Q_out_lag1/6`, `Q_out_roll24`, `dQout_dt`, `xa_dot_ngot`
 
 ### Changed
-- Mo hinh nang cap tu LSTM don gian → Bi-LSTM + Self-Attention
-- Chia du lieu: them tap Validation rieng biet (chong data leakage)
+- Mô hình nâng cấp từ LSTM đơn giản → Bi-LSTM nâng cao
+- Chia dữ liệu: thêm tập Validation riêng biệt (chống data leakage)
 
 ---
 
