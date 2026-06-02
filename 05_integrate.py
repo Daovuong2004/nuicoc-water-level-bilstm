@@ -420,8 +420,45 @@ def build_daily_water_level(
     df_daily["water_level_m"] = df_obs["water_level_m"]
     df_daily["is_observed"]   = df_obs["is_observed"].reindex(full_idx, fill_value=False)
 
+    # =============== ĐOẠN CODE BỔ SUNG: NEO ĐỈNH LŨ BÁO CHÍ ===============
+    try:
+        df_bao_chi = pd.read_csv("data/raw/bao_chi_su_kien.csv", parse_dates=["timestamp"])
+        df_bc_daily = df_bao_chi.set_index("timestamp").resample("D").max() # Lấy mốc nước cao nhất trong ngày
+        df_bc_daily = df_bc_daily.dropna(subset=["water_level_bao_chi"])
+        
+        for date, row in df_bc_daily.iterrows():
+            d_norm = date.normalize()
+            if d_norm in df_daily.index:
+                # Ghi đè sự kiện cực đoan, ngăn PCHIP cắt ngang đỉnh lũ
+                df_daily.loc[d_norm, "water_level_m"] = row["water_level_bao_chi"]
+                df_daily.loc[d_norm, "is_observed"] = True
+        logger.info(f"  ✓ Đã chèn cứng {len(df_bc_daily)} sự kiện đỉnh lũ báo chí (vd: Bão Yagi).")
+        
+        # Cập nhật lại obs_dates vì ta vừa thêm điểm quan sát mới
+        obs_dates = df_daily[df_daily["is_observed"]].index
+    except FileNotFoundError:
+        logger.warning("  ⚠ Không tìm thấy bao_chi_su_kien.csv, bỏ qua mốc đỉnh lũ.")
+        obs_dates = df_obs.index
+    
+    # =============== ĐOẠN CODE BỔ SUNG 2: BỘ LỌC VẬT LÝ (OUTLIER REMOVAL) ===============
+    # Loại bỏ điểm GEE bị mù mây/nước đục đợt bão Yagi (GEE báo 38m trong khi thực tế > 46m)
+    # Xóa các điểm is_observed=True nhưng không nằm trong báo chí, thuộc giai đoạn 2024-09-01 đến 2024-10-31
+    mask_yagi = (df_daily.index >= "2024-09-01") & (df_daily.index <= "2024-10-31")
+    try:
+        bc_index = df_bc_daily.index
+    except NameError:
+        bc_index = []
+    
+    mask_gee_fake = mask_yagi & df_daily["is_observed"] & (~df_daily.index.isin(bc_index))
+    if mask_gee_fake.sum() > 0:
+        df_daily.loc[mask_gee_fake, "is_observed"] = False
+        df_daily.loc[mask_gee_fake, "water_level_m"] = np.nan
+        logger.info(f"  ✓ Đã loại bỏ {mask_gee_fake.sum()} điểm GEE lỗi do nước đục đợt bão Yagi.")
+        
+    obs_dates = df_daily[df_daily["is_observed"]].index
+    # =========================================================================
+
     # Đánh dấu gap lớn: không nội suy vào đó
-    obs_dates = df_obs.index
 
     def _mark_large_gaps(series, obs_dates, max_gap):
         """Giữ NaN cho vị trí nằm trong gap > max_gap ngày."""

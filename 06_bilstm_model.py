@@ -51,7 +51,14 @@ from keras.regularizers import l2
 from keras.callbacks import (
     EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, CSVLogger,
 )
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, f1_score
+
+def evaluate_threshold_f1(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> float:
+    """Tính F1-Score cho bài toán phân loại nhị phân: vượt ngưỡng vận hành hay không?"""
+    y_true_bin = (y_true >= threshold).astype(int)
+    y_pred_bin = (y_pred >= threshold).astype(int)
+    # Bắt buộc tính recall & precision cho sự kiện vượt ngưỡng (Positive class)
+    return float(f1_score(y_true_bin, y_pred_bin, zero_division=0))
 
 # Cấu hình logging
 logging.basicConfig(
@@ -534,6 +541,19 @@ def train_and_evaluate(
                                     label=f"Val  (EarlyStopping) t+{horizon_d}d")
     metrics_test = evaluate_metrics(y_test, y_pred_test_mean,
                                     label=f"Test (Kiem dinh doc lap) t+{horizon_d}d")
+
+    # =============== ĐOẠN CODE BỔ SUNG: F1-SCORE ===============
+    MNDBT = 46.20
+    XA_LU = 46.50
+    f1_mndbt = evaluate_threshold_f1(y_test, y_pred_test_mean, MNDBT)
+    f1_xalu  = evaluate_threshold_f1(y_test, y_pred_test_mean, XA_LU)
+    
+    logger.info(f"  [Metrics Thực Chiến] F1-Score tại MNDBT ({MNDBT}m): {f1_mndbt:.4f}")
+    logger.info(f"  [Metrics Thực Chiến] F1-Score tại Ngưỡng Xả lũ ({XA_LU}m): {f1_xalu:.4f}")
+    # Đẩy vào object metrics để visualize nếu cần
+    metrics_test["f1_mndbt"] = f1_mndbt
+    metrics_test["f1_xalu"] = f1_xalu
+    # ============================================================
 
     # Lưu kết quả
     df_result = pd.DataFrame({
