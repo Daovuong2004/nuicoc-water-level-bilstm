@@ -66,58 +66,46 @@ FORECAST_DAYS = [1, 3, 7, 14, 30]  # Du bao t+1d, t+3d, t+7d, t+14d, t+30d
 
 
 # ============================================================
-# BO DAC TRUNG DAU VAO (21 features — v3.0 Daily)
+# BO DAC TRUNG DAU VAO (26 features — v4.0 Daily)
 # ============================================================
 FEATURE_COLS = [
-    # --- Khi tuong ngay ---
-    "rain_1d",            # Luong mua ngay (mm)
-    "rain_3d",            # Mua tich luy 3 ngay (mm)
-    "rain_7d",            # Mua tich luy 7 ngay (mm)
-    "rain_14d",           # Mua tich luy 14 ngay (mm)
-    "temperature",        # Nhiet do trung binh ngay (°C)
-    "humidity",           # Do am trung binh ngay (%)
-    # --- Lag muc nuoc ---
-    "water_level_lag1",   # Muc nuoc tre 1 ngay (m)
-    "water_level_lag3",   # Muc nuoc tre 3 ngay (m)
-    "water_level_lag7",   # Muc nuoc tre 7 ngay (m)
-    "water_level_lag14",  # Muc nuoc tre 14 ngay (m)
-    "water_level_lag30",  # Muc nuoc tre 30 ngay (m)
-    # --- Rolling statistics ---
-    "water_level_roll7",  # Trung binh truot muc nuoc 7 ngay (m)
-    "water_level_roll30", # Trung binh truot muc nuoc 30 ngay (m)
-    "water_level_std7",   # Do lech chuan muc nuoc 7 ngay (m)
-    # --- Temporal encoding (tuan hoan) ---
-    "month_sin",          # Ma hoa tuan hoan thang (sin)
-    "month_cos",          # Ma hoa tuan hoan thang (cos)
-    "season_wet",         # Mua mua: thang 5-10 (1/0)
-    "season_dry",         # Mua kho: thang 11-4 (1/0)
-    # --- Q_out daily (phuong trinh can bang nuoc) ---
-    "dH_dt_daily",        # Toc do thay doi muc nuoc (m/ngay)
-    "Q_out_daily",        # Luu luong xa uoc tinh ngay (m³/s)
-    "Q_out_roll7",        # Trung binh truot luu luong xa 7 ngay (m³/s)
+    # Khí tượng (7 features)
+    "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
+    "temperature", "humidity",
+    # Lag mực nước (6 features)
+    "water_level_lag1", "water_level_lag3", "water_level_lag7",
+    "water_level_lag14", "water_level_lag30", "water_level_lag60",
+    # Rolling stats (4 features)
+    "water_level_roll7", "water_level_roll30", "water_level_roll60",
+    "water_level_std7",
+    # Temporal (4 features)
+    "month_sin", "month_cos", "season_wet", "season_dry",
+    # Xu hướng thủy văn (2 features)
+    "delta_h_7d", "delta_h_30d",
+    # Q_out (3 features)
+    "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
 ]
 
-FEATURE_COUNT = len(FEATURE_COLS)  # 21
+FEATURE_COUNT = len(FEATURE_COLS)  # 26
 TARGET_COL    = "water_level_m"
 
 
 # ============================================================
 # CUA SO THOI GIAN
 # ============================================================
-WINDOW_SIZE = 30  # Nhin lai 30 ngay (1 thang) de du bao
+WINDOW_SIZE = 60  # Nhin lai 60 ngay (2 thang) de du bao
 
 
 # ============================================================
-# SIEU THAM SO MO HINH BI-LSTM + ATTENTION
+# SIEU THAM SO MO HINH BI-LSTM
 # ============================================================
-LSTM_UNITS    = [128, 64]   # So unit cua BiLSTM lop 1 va 2
-DROPOUT_RATE  = 0.2         # Ti le Dropout (dung ca MC Dropout inference)
+LSTM_UNITS    = [256, 128]  # So unit cua BiLSTM lop 1 va 2
+DROPOUT_RATE  = 0.25        # Ti le Dropout (dung ca MC Dropout inference)
 LEARNING_RATE = 0.001       # Adam optimizer learning rate
 BATCH_SIZE    = 32
-MAX_EPOCHS    = 200
-PATIENCE      = 15          # EarlyStopping patience
-ATTN_HEADS    = 4           # So dau Multi-Head Attention
-ATTN_KEY_DIM  = 32          # Chieu key/query cua Attention
+MAX_EPOCHS     = 300
+PATIENCE      = 20          # EarlyStopping patience
+L2_REG        = 1e-4        # L2 Regularization cho Dense layers
 MC_SAMPLES    = 50          # So lan chay Monte Carlo Dropout
 
 
