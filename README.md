@@ -1,4 +1,4 @@
-# Du bao muc nuoc ho Nui Coc — Bi-LSTM + Self-Attention
+# Du bao muc nuoc ho Nui Coc — Bi-LSTM
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.13+-orange.svg)](https://tensorflow.org)
@@ -8,13 +8,13 @@
 [![GEE](https://img.shields.io/badge/Google%20Earth%20Engine-Sentinel--2-brightgreen)](https://earthengine.google.com)
 
 > **Do an tot nghiep** — Nganh Cong nghe Thong tin (Ky thuat Phan mem)
-> De tai: *He thong du bao muc nuoc ho Nui Coc su dung kien truc mo hinh Bi-LSTM + Self-Attention*
+> De tai: *He thong du bao muc nuoc ho Nui Coc su dung kien truc mo hinh Bi-LSTM*
 
 ---
 
 ## Tong quan
 
-Pipeline hoc may end-to-end du bao muc nuoc ho Nui Coc (Thai Nguyen) cho cac chan troi thoi gian **t+1d, t+3d, t+7d, t+14d, t+30d** su dung mo hinh **Bidirectional LSTM + Multi-Head Self-Attention** ket hop **Monte Carlo Dropout** de uoc luong do khong chac chan.
+Pipeline hoc may end-to-end du bao muc nuoc ho Nui Coc (Thai Nguyen) cho cac chan troi thoi gian **t+1d, t+3d, t+7d, t+14d, t+30d** su dung mo hinh **Bidirectional LSTM** ket hop **Monte Carlo Dropout** de uoc luong do khong chac chan.
 
 ### Kien truc he thong
 
@@ -23,7 +23,7 @@ Nguon du lieu                    Pipeline                       Dau ra
 ───────────────────────────────────────────────────────────────────────────
 NASA POWER API   ─┐
 GEE Sentinel-2   ─┤─► 05_integrate.py ──► 06_bilstm_model.py ──► Du bao muc nuoc
-Bao chi/Cua xa   ─┘   (Kalman + Q_out)   (Bi-LSTM+Attention)    + Khoang tin cay 95%
+Bao chi/Cua xa   ─┘   (Kalman + Q_out)   (Bi-LSTM)              + Khoang tin cay 95%
                                                 │
                                        08_api_serve.py ──► REST API (FastAPI)
 ```
@@ -32,9 +32,9 @@ Bao chi/Cua xa   ─┘   (Kalman + Q_out)   (Bi-LSTM+Attention)    + Khoang tin
 
 | Thanh phan | Ky thuat |
 |-----------|---------|
-| **Mo hinh** | Bi-LSTM 2 lop + Multi-Head Self-Attention (4 heads, key_dim=32) + Residual + LayerNorm |
+| **Mo hinh** | Bi-LSTM 2 lop (256, 128) + Dense (L2 regularizer) |
 | **Uncertainty** | Monte Carlo Dropout (50 samples) → khoang tin cay 95% cho tung du bao |
-| **XAI** | SHAP Feature Importance — giai thich "mo hinh dua vao gi" |
+| **XAI** | SHAP Feature Importance — gia thich "mo hinh dua vao gi" |
 | **Du lieu ve tinh** | Sentinel-2 SR + QA60 cloud mask → NDWI → duong cong A-H |
 | **Thuy van** | Phuong trinh can bang nuoc: Q_out = -A(H) × dH/dt / 86400 |
 | **Noi suy** | PCHIP interpolation (bao toan don dieu cuc bo) cho gap ≤ 60 ngay |
@@ -54,8 +54,8 @@ DATN/
 ├── 02_gee_colab.py             # Buoc 2b: Trich xuat GEE tren Google Colab
 ├── 03_04_cua_xa_bao_chi.py     # Buoc 3+4: Cua xa + su kien lu tu bao chi
 ├── 05_integrate.py             # Buoc 5: Tich hop + Kalman + Q_out + normalize
-├── 06_bilstm_model.py          # Buoc 6: Huan luyen Bi-LSTM + Attention + SHAP
-├── 06b_baseline_comparison.py  # Buoc 6b: Ablation study SARIMA/LSTM/BiLSTM
+├── 06_bilstm_model.py          # Buoc 6: Huan luyen Bi-LSTM + SHAP
+├── 06b_baseline_comparison.py  # Buoc 6b: Ablation study SARIMA/LSTM/GRU/BiLSTM
 ├── 07_infer_qout_1.py          # Buoc 7: Phan tich Q_out (tuy chon)
 ├── 08_api_serve.py             # Buoc 8: FastAPI inference server
 ├── run_all.py                  # Chay toan bo pipeline mot lenh
@@ -139,21 +139,22 @@ Sau khi khoi dong, truy cap:
 
 ---
 
-## Bo dac trung dau vao (21 features)
+## Bo dac trung dau vao (26 features)
 
 | Nhom | Features | Mo ta |
 |------|---------|-------|
-| **Khi tuong** | `rain_1d`, `rain_3d`, `rain_7d`, `rain_14d` | Luong mua tich luy (mm) |
+| **Khi tuong** | `rain_1d`, `rain_3d`, `rain_7d`, `rain_14d`, `rain_30d` | Luong mua tich luy (mm) |
 | **Khi tuong** | `temperature`, `humidity` | Nhiet do (°C), Do am (%) |
-| **Lag muc nuoc** | `water_level_lag1/3/7/14/30` | Muc nuoc tre 1/3/7/14/30 ngay (m) |
-| **Rolling stats** | `water_level_roll7`, `water_level_roll30` | Trung binh truot 7/30 ngay (m) |
+| **Lag muc nuoc** | `water_level_lag1/3/7/14/30/60` | Muc nuoc tre 1/3/7/14/30/60 ngay (m) |
+| **Rolling stats** | `water_level_roll7/30/60` | Trung binh truot 7/30/60 ngay (m) |
 | **Rolling stats** | `water_level_std7` | Do lech chuan muc nuoc 7 ngay (m) |
 | **Temporal** | `month_sin`, `month_cos` | Ma hoa tuan hoan thang |
 | **Temporal** | `season_wet`, `season_dry` | Mua mua/kho (0/1) |
+| **Xu huong** | `delta_h_7d`, `delta_h_30d` | Bien doi muc nuoc 7/30 ngay truoc (m) |
 | **Q_out** | `dH_dt_daily` | Toc do thay doi muc nuoc (m/ngay) |
 | **Q_out** | `Q_out_daily`, `Q_out_roll7` | Luu luong xa uoc tinh (m³/s) |
 
-**Cua so thoi gian**: 30 ngay | **Chan troi du bao**: 1, 3, 7, 14, 30 ngay
+**Cua so thoi gian**: 60 ngay | **Chan troi du bao**: 1, 3, 7, 14, 30 ngay
 
 ---
 
@@ -169,22 +170,19 @@ Sau khi khoi dong, truy cap:
 
 ---
 
-## Kien truc mo hinh Bi-LSTM + Self-Attention
+## Kien truc mo hinh Bi-LSTM
 
 ```
-Input (30, 21)
+Input (60, 26)
     │
     ▼
-BiLSTM(128, return_sequences=True) ── Dropout(0.2) ── BatchNorm
+BiLSTM(256, return_sequences=True) ── Dropout(0.25)
     │
     ▼
-Multi-Head Self-Attention(heads=4, key_dim=32, dropout=0.2)
+BiLSTM(128, return_sequences=False) ── Dropout(0.25)
     │
     ▼
-Residual Add + LayerNorm           ◄── Skip connection tu BiLSTM(128)
-    │
-    ▼
-BiLSTM(64, return_sequences=False) ── Dropout(0.2) ── BatchNorm
+Dense(64, relu) ── L2(1e-4)
     │
     ▼
 Dense(32, relu) → Dense(1, linear)
@@ -193,8 +191,8 @@ Dense(32, relu) → Dense(1, linear)
 Output: Muc nuoc du bao (m)
 ```
 
-**Ly do dung Self-Attention trong thuy van:**
-Muc nuoc luc 8h sang bi anh huong boi con mua luc 20h hom qua (lag xa). LSTM xu ly kem khi "buoc thoi gian quan trong" nam xa trong sequence. Self-Attention giai quyet dieu nay: moi timestep "nhin" tat ca cac timestep khac va hoc trong so quan trong.
+**Ly do dung Bi-LSTM trong thuy van:**
+Bi-LSTM xu ly chuoi thoi gian theo ca hai chieu (xuoi va nguoc). Chieu xuoi giup hoc xu huong tich luy mua va tang muc nuoc. Chieu nguoc giup nam bat cac quy luat chu ky mua kho va dien bien ha luu cua ho chua.
 
 ---
 
@@ -204,7 +202,7 @@ Muc nuoc luc 8h sang bi anh huong boi con mua luc 20h hom qua (lag xa). LSTM xu 
 |--------|----------|-------|
 | `POST` | `/predict` | Du bao muc nuoc t+1/3/7/14/30d + khoang tin cay 95% |
 | `GET` | `/health` | Trang thai server + cac model da tai |
-| `GET` | `/features` | Danh sach 21 features theo dung thu tu |
+| `GET` | `/features` | Danh sach 26 features theo dung thu tu |
 | `GET` | `/thresholds` | Nguong canh bao lu ho Nui Coc |
 
 ### Vi du goi API
@@ -213,7 +211,7 @@ Muc nuoc luc 8h sang bi anh huong boi con mua luc 20h hom qua (lag xa). LSTM xu 
 curl -X POST "http://localhost:8000/predict" \
   -H "Content-Type: application/json" \
   -d '{
-    "features": [[0.0]*21]*30,
+    "features": [[0.0]*26]*60,
     "timestamp": "2026-06-01T00:00:00+07:00"
   }'
 ```
