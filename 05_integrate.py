@@ -50,13 +50,35 @@ logger = logging.getLogger(__name__)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _THIS_DIR)
 
+from config import (
+    FEATURE_COLS,
+    FORECAST_DAYS,
+    TARGET_COL,
+    BASE_LEVEL_COL,
+    TRAIN_END,
+    VAL_END,
+    TRAIN_START,
+    AUG_START,
+    AUG_END_EXCLUSIVE,
+    MAX_INTERP_GAP_DAYS,
+    ENABLE_FLOOD_INJECTION,
+    SAMPLE_WEIGHT_OBSERVED,
+    SAMPLE_WEIGHT_OTHER,
+    SAMPLE_WEIGHT_FLOOD,
+    FLOOD_DELTA_THRESHOLD_M,
+    target_delta_col,
+    PREDICT_DELTA_H,
+    target_delta_col,
+    target_abs_col,
+)
+
 
 # ============================================================
 # CẤU HÌNH
 # ============================================================
-OUTPUT_TRAIN = "data/final/dataset_train.csv"   # 2017-2022: huan luyen
-OUTPUT_VAL   = "data/final/dataset_val.csv"     # 2023: EarlyStopping (khong bao cao)
-OUTPUT_TEST  = "data/final/dataset_test.csv"    # 2024+: kiem dinh cuoi (bao cao luan van)
+OUTPUT_TRAIN = "data/final/dataset_train.csv"   # huan luyen
+OUTPUT_VAL   = "data/final/dataset_val.csv"     # kiem dinh doc lap (2024+)
+OUTPUT_TEST  = "data/final/dataset_test.csv"    # EarlyStopping (2023)
 OUTPUT_FULL  = "data/final/dataset_full.csv"
 
 # ============================================================
@@ -67,86 +89,7 @@ OUTPUT_FULL  = "data/final/dataset_full.csv"
 # VAL   (Internal Validation): 2023-01-01 → 2023-12-31
 #   Dung cho Keras EarlyStopping + ReduceLROnPlateau.
 #   KHONG duoc dung lam ket qua bao cao trong luan van.
-# TEST  (Independent Validation): 2024-01-01 → hien tai
-#   Tap kiem dinh doc lap. Bao gom su kien lu Yagi thang 9/2024.
-#   Day la ket qua duoc bao cao chinh trong luan van.
-TRAIN_END = "2022-12-31"
-VAL_END   = "2023-12-31"
-# Test: 2024-01-01 -> hien tai (bao gom lu Yagi thang 9/2024)
-
-# Thông số augmentation
-AUG_START           = "2017-01-01"  # Bắt đầu từ khi Sentinel-2A phóng
-AUG_END_EXCLUSIVE   = "2019-04-01"  # Điểm GEE đầu tiên thực sự
-MAX_INTERP_GAP_DAYS = 60            # Không nội suy quá 60 ngày liên tục
-
-# Feature columns cho BiLSTM daily
-FEATURE_COLS = [
-    # --- Khí tượng ngày ---
-    "rain_1d",           # Lượng mưa ngày (mm)
-    "rain_3d",           # Mưa tích lũy 3 ngày
-    "rain_7d",           # Mưa tích lũy 7 ngày
-    "rain_14d",          # Mưa tích lũy 14 ngày
-    "temperature",       # Nhiệt độ trung bình ngày (°C)
-    "humidity",          # Độ ẩm trung bình ngày (%)
-    # --- Lag mực nước ngày ---
-    "water_level_lag1",  # Mực nước ngày hôm qua
-    "water_level_lag3",  # 3 ngày trước
-    "water_level_lag7",  # 7 ngày trước (xu hướng tuần)
-    "water_level_lag14", # 14 ngày trước
-    "water_level_lag30", # 30 ngày trước (xu hướng tháng)
-    # --- Rolling statistics ---
-    "water_level_roll7",  # Trung bình mực nước 7 ngày
-    "water_level_roll30", # Trung bình mực nước 30 ngày
-    "water_level_std7",   # Độ lệch chuẩn mực nước 7 ngày (biến động)
-    # --- Temporal encoding ---
-    "month_sin",          # Mã hóa tuần hoàn tháng (sin)
-    "month_cos",          # Mã hóa tuần hoàn tháng (cos)
-    "season_wet",         # Mùa mưa (tháng 5-10)
-    "season_dry",         # Mùa khô (tháng 11-4)
-    # --- Q_out daily ---
-    "dH_dt_daily",        # Tốc độ thay đổi mực nước (m/ngày)
-    "Q_out_daily",        # Lưu lượng xả ước tính ngày (m3/s)
-    "Q_out_roll7",        # Trung bình xả 7 ngày
-]
-
-TARGET_COL    = "water_level_m"
-FORECAST_DAYS = [1, 3, 7, 14, 30]  # Dự báo 1/3/7/14/30 ngày
-
-# Feature columns cho BiLSTM daily (v4.0 — 26 features)
-FEATURE_COLS = [
-    # --- Khí tượng ngày (6 features) ---
-    "rain_1d",           # Lượng mưa ngày (mm)
-    "rain_3d",           # Mưa tích lũy 3 ngày
-    "rain_7d",           # Mưa tích lũy 7 ngày
-    "rain_14d",          # Mưa tích lũy 14 ngày
-    "rain_30d",          # Mưa tích lũy 30 ngày (mùa vụ) [MỚI]
-    "temperature",       # Nhiệt độ trung bình ngày (°C)
-    "humidity",          # Độ ẩm trung bình ngày (%)
-    # --- Lag mực nước (7 features) ---
-    "water_level_lag1",  # Mực nước ngày hôm qua
-    "water_level_lag3",  # 3 ngày trước
-    "water_level_lag7",  # 7 ngày trước (xu hướng tuần)
-    "water_level_lag14", # 14 ngày trước
-    "water_level_lag30", # 30 ngày trước (xu hướng tháng)
-    "water_level_lag60", # 60 ngày trước (xu hướng mùa) [MỚI]
-    # --- Rolling statistics (5 features) ---
-    "water_level_roll7",  # Trung bình mực nước 7 ngày
-    "water_level_roll30", # Trung bình mực nước 30 ngày
-    "water_level_roll60", # Trung bình mực nước 60 ngày (mùa) [MỚI]
-    "water_level_std7",   # Độ lệch chuẩn mực nước 7 ngày (biến động)
-    # --- Temporal encoding (4 features) ---
-    "month_sin",          # Mã hóa tuần hoàn tháng (sin)
-    "month_cos",          # Mã hóa tuần hoàn tháng (cos)
-    "season_wet",         # Mùa mưa (tháng 5-10)
-    "season_dry",         # Mùa khô (tháng 11-4)
-    # --- Biến đổi thủy văn (2 features) [MỚI] ---
-    "delta_h_7d",         # Thay đổi mực nước so với 7 ngày trước (trend ngắn)
-    "delta_h_30d",        # Thay đổi mực nước so với 30 ngày trước (trend dài)
-    # --- Q_out daily (3 features) ---
-    "dH_dt_daily",        # Tốc độ thay đổi mực nước (m/ngày)
-    "Q_out_daily",        # Lưu lượng xả ước tính ngày (m3/s)
-    "Q_out_roll7",        # Trung bình xả 7 ngày
-]
+# (TRAIN_END, VAL_END, FEATURE_COLS, ... imported from config.py v5)
 
 # Đường cong A-H (giống 02_gee_colab.py) — dùng cho Q_out daily
 AH_CURVE = [
@@ -556,6 +499,8 @@ def aggregate_nasa_daily(path_nasa: str) -> pd.DataFrame:
         agg_dict["temperature"] = ("temperature", "mean")
     if "humidity" in df.columns:
         agg_dict["humidity"] = ("humidity", "mean")
+    if "gwettop" in df.columns:
+        agg_dict["gwettop"] = ("gwettop", "mean")
 
     df_daily = df.resample("D").agg(**agg_dict)
 
@@ -577,7 +522,86 @@ def aggregate_nasa_daily(path_nasa: str) -> pd.DataFrame:
 
 
 # ============================================================
-# 5e: FEATURE ENGINEERING NGÀY
+# 5e: TẠO ĐỈNH LŨ GIẢ LẬP (HYDROLOGICAL INJECTION)
+# ============================================================
+def inject_synthetic_flood_peaks(
+    df_level: pd.DataFrame,
+    df_nasa: pd.DataFrame,
+    K_factor: float = 0.0065
+) -> pd.DataFrame:
+    """
+    Mô phỏng Thủy văn (Hydrological Injection) dựa trên phương pháp SCS-CN.
+    delta_H = K * GWETTOP * rain_1d
+    K = 0.0065 (hệ số lưu vực thực nghiệm Hồ Núi Cốc)
+    """
+    df = df_level.copy()
+    
+    if "rain_1d" not in df_nasa.columns or "gwettop" not in df_nasa.columns:
+        logger.warning("Thiếu cột rain_1d hoặc gwettop trong NASA data. Bỏ qua Hydrological Injection.")
+        return df
+        
+    common_idx = df.index.intersection(df_nasa.index)
+    rain_1d_series = df_nasa.loc[common_idx, "rain_1d"]
+    gwettop_series = df_nasa.loc[common_idx, "gwettop"]
+    
+    # Bơm vào toàn bộ tập dữ liệu (Train, Val, Test) để sửa lỗi GEE bị thiếu đỉnh lũ.
+    # Các đỉnh lũ thực tế từ báo chí (bão Yagi) sẽ không bị ghi đè nếu chúng cao hơn mô phỏng.
+    train_val_idx = common_idx
+    
+    injected_count = 0
+    
+    for date in train_val_idx:
+        rain_raw = rain_1d_series.loc[date]
+        gwettop = gwettop_series.loc[date]
+        
+        # Giới hạn lượng mưa tối đa 450mm/ngày để loại bỏ các nhiễu vệ tinh NASA (outliers > 4000mm)
+        rain = min(rain_raw, 450.0)
+        
+        # Chỉ kích hoạt nếu mưa đủ lớn (> 50mm/ngày) để tránh nhiễu
+        if rain > 50:
+            delta_H = K_factor * gwettop * rain
+            
+            # Định tuyến (Routing): Đỉnh lũ thường xuất hiện sau 1 ngày
+            peak_date = date + pd.Timedelta(days=1)
+            
+            if peak_date in df.index:
+                current_level = df.loc[peak_date, "water_level_m"]
+                
+                # Xác định mực nước nền (Base Flow Level)
+                month = peak_date.month
+                if 6 <= month <= 10:
+                    base_level = max(44.0, current_level)
+                else:
+                    base_level = max(38.0, current_level)
+                    
+                synthetic_peak = base_level + delta_H
+                
+                # Giới hạn đỉnh lũ ảo ở 47.0m (ngưỡng xả lũ khẩn cấp). 
+                # Điều này giúp các sự kiện báo chí thực tế (như Yagi 47.6m) không bao giờ bị ghi đè,
+                # đồng thời ngăn chặn lỗi cộng dồn vô hạn (runaway accumulation).
+                synthetic_peak = min(47.0, synthetic_peak)
+                
+                if synthetic_peak > current_level:
+                    df.loc[peak_date, "water_level_m"] = synthetic_peak
+                    df.loc[peak_date, "is_observed"] = True
+                    injected_count += 1
+                    
+    logger.info(f"  [Augment] Đã bơm {injected_count} đỉnh lũ vật lý (delta_H = 0.0065 * GWETTOP * Rain) vào TOÀN BỘ dữ liệu.")
+    
+    # Nội suy PCHIP lại một lần nữa để làm mượt các đỉnh lũ vừa chèn
+    obs_mask = df["is_observed"]
+    obs_series = df.loc[obs_mask, "water_level_m"]
+    
+    if len(obs_series) > 1:
+        from scipy.interpolate import PchipInterpolator
+        interp_func = PchipInterpolator(obs_series.index.view("int64"), obs_series.values, extrapolate=False)
+        df["water_level_m"] = interp_func(df.index.view("int64"))
+        
+    return df
+
+
+# ============================================================
+# 5f: FEATURE ENGINEERING NGÀY
 # ============================================================
 def build_daily_features(
     df_level: pd.DataFrame,
@@ -605,8 +629,10 @@ def build_daily_features(
     pd.DataFrame
         DataFrame đầy đủ features.
     """
-    logger.info("[5e] Xây dựng features ngày..."
-                " (v4.0 — 26 features: +rain_30d, +lag60, +roll60, +delta_h_7d/30d)")
+    logger.info(
+        "[5e] Xây dựng features ngày (v5 — %d features, không gồm water_level_m)",
+        len(FEATURE_COLS),
+    )
 
     df = df_level.copy()
 
@@ -621,42 +647,19 @@ def build_daily_features(
     if "rain_1d" in df.columns:
         df["rain_30d"] = df["rain_1d"].rolling(30, min_periods=1).sum()  # [MỚI]
 
-    # --- Lag mực nước ---
-    for lag in [1, 3, 7, 14, 30, 60]:
+    # --- Lag mực nước (chỉ quá khứ — không rò rỉ) ---
+    for lag in [1, 3, 7, 14, 30]:
         df[f"water_level_lag{lag}"] = df["water_level_m"].shift(lag)
 
     # --- Rolling statistics ---
-    df["water_level_roll7"]  = df["water_level_m"].rolling(7,  min_periods=3).mean()
-    df["water_level_roll30"] = df["water_level_m"].rolling(30, min_periods=7).mean()
-    df["water_level_roll60"] = df["water_level_m"].rolling(60, min_periods=14).mean()  # [MỚI]
-    df["water_level_std7"]   = df["water_level_m"].rolling(7,  min_periods=3).std()
+    df["water_level_roll7"] = df["water_level_m"].rolling(7, min_periods=3).mean()
+    df["water_level_std7"]  = df["water_level_m"].rolling(7, min_periods=3).std()
 
     # --- Temporal encoding (tuần hoàn) ---
     df["month_sin"]  = np.sin(2 * np.pi * df.index.month / 12)
     df["month_cos"]  = np.cos(2 * np.pi * df.index.month / 12)
     df["season_wet"] = df.index.month.isin([5, 6, 7, 8, 9, 10]).astype(int)
     df["season_dry"] = df.index.month.isin([11, 12, 1, 2, 3, 4]).astype(int)
-
-    # --- Biến đổi thủy văn (xu hướng) [MỚI] ---
-    df["delta_h_7d"]  = df["water_level_m"] - df["water_level_lag7"]   # Thay đổi 7 ngày
-    df["delta_h_30d"] = df["water_level_m"] - df["water_level_lag30"]  # Thay đổi 30 ngày
-
-    # --- Q_out daily (phương trình cân bằng nước) ---
-    # dH/dt (m/ngày)
-    df["dH_dt_daily"] = df["water_level_m"].diff(1)
-
-    # Diện tích mặt hồ tại mực nước H (m2)
-    df["_area_m2"] = df["water_level_m"].apply(
-        lambda h: float(_level_to_area(h)) if pd.notna(h) else np.nan
-    )
-
-    # Q_out = -A(H) * dH/dt / 86400  [m3/s]
-    # Dấu âm: mực nước giảm (dH < 0) -> đang xả ra ngoài
-    df["Q_out_daily"] = -(df["_area_m2"] * df["dH_dt_daily"]) / 86400.0
-    df["Q_out_daily"] = df["Q_out_daily"].clip(lower=0)
-    df["Q_out_roll7"] = df["Q_out_daily"].rolling(7, min_periods=1).mean()
-
-    df.drop(columns=["_area_m2"], inplace=True)
 
     logger.info(
         "  Features: %d cột x %d ngày | mực nước %.2f-%.2fm",
@@ -677,6 +680,10 @@ def add_forecast_targets(
     """Tạo cột target cho từng khoảng dự báo ngày (shift(-d))."""
     if horizons is None:
         horizons = FORECAST_DAYS
+        
+    # FIXED: Đã kiểm tra target shifting. Hàm shift(-d) dịch chuyển mục tiêu về phía trước (backward trong pandas), 
+    # nghĩa là hàng t sẽ mang giá trị của t+d. Điều này là ĐÚNG. Lỗi thực sự nằm ở hàm create_sequences 
+    # của 06_bilstm_model.py (đã được sửa) vì nó bỏ lọt thông tin của ngày hiện tại t.
     for d in horizons:
         df[f"target_t{d}d"] = df["water_level_m"].shift(-d)
     return df
@@ -695,9 +702,12 @@ def normalize_features(
     Min-Max normalization — scaler fit ONLY trên train.
     Anti data-leakage: val/test thống kê không ảnh hưởng training.
     """
-    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.preprocessing import StandardScaler
 
-    scaler = MinMaxScaler()
+    # Dùng StandardScaler thay cho MinMaxScaler để hỗ trợ mô hình ngoại suy (Extrapolation).
+    # MinMaxScaler ép data về [0, 1], khi gặp lũ lịch sử (Yagi) > max của tập Train, 
+    # đầu vào sẽ lớn hơn 1 và có thể làm bão hòa mạng LSTM.
+    scaler = StandardScaler()
     df_train = df_train.copy()
     df_val   = df_val.copy()
     df_test  = df_test.copy()
@@ -749,6 +759,12 @@ def main():
     logger.info("\n[Resample] Xay dung chuoi muc nuoc ngay...")
     df_daily_level = build_daily_water_level(df_gee, df_synth)
 
+    if ENABLE_FLOOD_INJECTION:
+        logger.info("\n[Inject] Bom dinh lu SCS-CN (toan bo chuoi)...")
+        df_daily_level = inject_synthetic_flood_peaks(df_daily_level, df_nasa_daily)
+    else:
+        logger.info("\n[Inject] TAT — khong bom dinh lu synthetic (v5 anti-overfit)")
+
     # -- 5e: Feature engineering --
     logger.info("\n[Features] Xay dung features ngay...")
     df = build_daily_features(df_daily_level, df_nasa_daily)
@@ -764,14 +780,39 @@ def main():
     logger.info("\n[Target] Tao cot du bao t+1/3/7/14/30 ngay...")
     df = add_forecast_targets(df)
 
+    # Mốc H(t) và ΔH cho mô hình v5 (trước khi scale features)
+    df[BASE_LEVEL_COL] = df[TARGET_COL].astype(float)
+    if PREDICT_DELTA_H:
+        for d in FORECAST_DAYS:
+            df[target_delta_col(d)] = df[target_abs_col(d)] - df[BASE_LEVEL_COL]
+
+    # Trọng số mẫu: quan trắc thật + nhấn mạnh biến động lớn |ΔH|
+    if "is_observed" in df.columns:
+        df["sample_weight"] = np.where(
+            df["is_observed"].astype(bool),
+            SAMPLE_WEIGHT_OBSERVED,
+            SAMPLE_WEIGHT_OTHER,
+        )
+    else:
+        df["sample_weight"] = SAMPLE_WEIGHT_OBSERVED
+    d1 = target_delta_col(1)
+    if d1 in df.columns:
+        df["sample_weight"] *= np.where(
+            np.abs(df[d1]) >= FLOOD_DELTA_THRESHOLD_M,
+            SAMPLE_WEIGHT_FLOOD,
+            1.0,
+        )
+
     # Cắt hàng đầu/cuối do lag và forecast horizon
-    max_lag     = 60  # water_level_lag60 [cập nhật v4.0]
-    max_horizon = 30  # target_t30d
+    max_lag     = 30
+    max_horizon = 30
     df = df.iloc[max_lag:-max_horizon].copy()
 
     # Loại hàng NaN trong features/targets
-    target_cols   = [f"target_t{d}d" for d in FORECAST_DAYS]
-    required_cols = FEATURE_COLS + target_cols
+    target_cols   = [target_abs_col(d) for d in FORECAST_DAYS]
+    if PREDICT_DELTA_H:
+        target_cols += [target_delta_col(d) for d in FORECAST_DAYS]
+    required_cols = FEATURE_COLS + target_cols + [BASE_LEVEL_COL, "sample_weight"]
     avail_cols    = [c for c in required_cols if c in df.columns]
     df = df.dropna(subset=avail_cols)
 
@@ -783,30 +824,39 @@ def main():
         "  Giai doan: %s -> %s",
         df.index.min().date(), df.index.max().date()
     )
+    
+    # FIXED: In ra thông tin kiểm tra dataset để đảm bảo việc xử lý NaN ở cuối (do shift) hoạt động đúng.
+    logger.info("\n[Check] Kiem tra dataset cuoi cung:")
+    logger.info("  Shape: %s", df.shape)
+    for d in FORECAST_DAYS:
+        col = f"target_t{d}d"
+        if col in df.columns:
+            logger.info("  Range %s: %.2f - %.2f", col, df[col].min(), df[col].max())
+    logger.info("  3 hang cuoi cung:\n%s", df[target_cols + ["water_level_m"]].tail(3))
 
-    # ── Chia 3 tap: Train / Val / Test ──────────────────────────────
-    # Train : Fit toan bo tham so Bi-LSTM (calibration)
-    # Val   : EarlyStopping + ReduceLR (internal validation, KHONG bao cao)
-    # Test  : Kiem dinh doc lap — BAO CAO chinh trong luan van
-    df_train = df[df.index <= TRAIN_END].copy()
-    df_val   = df[(df.index > TRAIN_END) & (df.index <= VAL_END)].copy()
-    df_test  = df[df.index > VAL_END].copy()
+    # ── Chia 3 tap: Train / Test / Val (Theo đúng yêu cầu của người dùng) ──────────
+    # Train : Huấn luyện mô hình (2020-2022)
+    # Test  : Dùng cho EarlyStopping (2023)
+    # Val   : Tập Kiểm định Độc lập cuối cùng (2024-2025)
+    df_train = df[(df.index >= TRAIN_START) & (df.index <= TRAIN_END)].copy()
+    df_test  = df[(df.index > TRAIN_END) & (df.index <= VAL_END)].copy()
+    df_val   = df[df.index > VAL_END].copy()
 
-    logger.info("\n[Split] 3-Way Split (Train / Val / Test):")
+    logger.info("\n[Split] 3-Way Split (Train / Test / Val):")
     logger.info(
-        "  Train (Calibration)          : %d ngay (%s -> %s)",
+        "  Train (Huấn luyện)           : %d ngay (%s -> %s)",
         len(df_train),
         df_train.index.min().date(), df_train.index.max().date()
     )
     logger.info(
-        "  Val   (EarlyStopping/Tuning) : %d ngay (%s -> %s)  <- khong bao cao",
-        len(df_val),
-        df_val.index.min().date(), df_val.index.max().date()
-    )
-    logger.info(
-        "  Test  (Kiem dinh doc lap)    : %d ngay (%s -> %s)  <- BAO CAO LUAN VAN",
+        "  Test  (EarlyStopping)        : %d ngay (%s -> %s)  <- Dừng sớm",
         len(df_test),
         df_test.index.min().date(), df_test.index.max().date()
+    )
+    logger.info(
+        "  Val   (Kiểm định Độc lập)    : %d ngay (%s -> %s)  <- BÁO CÁO LUẬN VĂN",
+        len(df_val),
+        df_val.index.min().date(), df_val.index.max().date()
     )
 
     # Canh bao dataset nho
@@ -815,12 +865,12 @@ def main():
             "CANH BAO: Train chi co %d ngay (nen >= 300 de Bi-LSTM on dinh).",
             len(df_train)
         )
-    if len(df_val) < 60:
-        logger.warning("CANH BAO: Val chi co %d ngay (nen >= 60 cho EarlyStopping).", len(df_val))
-    if len(df_test) < 100:
+    if len(df_test) < 60:
+        logger.warning("CANH BAO: Test chi co %d ngay (nen >= 60 cho EarlyStopping).", len(df_test))
+    if len(df_val) < 100:
         logger.warning(
-            "CANH BAO: Test chi co %d ngay (nen >= 100 de ket qua kiem dinh tin cay).",
-            len(df_test)
+            "CANH BAO: Val chi co %d ngay (nen >= 100 de ket qua kiem dinh tin cay).",
+            len(df_val)
         )
 
     # -- Chuẩn hóa --
@@ -831,19 +881,19 @@ def main():
 
     # -- Lưu --
     df_train.to_csv(OUTPUT_TRAIN)
-    df_val.to_csv(OUTPUT_VAL)
     df_test.to_csv(OUTPUT_TEST)
+    df_val.to_csv(OUTPUT_VAL)
 
     logger.info("\n[Luu] Da luu:")
     logger.info("  %s (%d dong)", OUTPUT_TRAIN, len(df_train))
-    logger.info("  %s (%d dong)", OUTPUT_VAL,   len(df_val))
     logger.info("  %s (%d dong)", OUTPUT_TEST,  len(df_test))
+    logger.info("  %s (%d dong)", OUTPUT_VAL,   len(df_val))
 
     logger.info("\n" + "=" * 65)
-    logger.info("TOM TAT BO DU LIEU (3-WAY SPLIT):")
+    logger.info("TOM TAT BO DU LIEU (TRAIN / TEST / VAL):")
     logger.info(
-        "  Tong: %d ngay | Train: %d | Val: %d | Test: %d",
-        len(df), len(df_train), len(df_val), len(df_test)
+        "  Tong: %d ngay | Train: %d | Test: %d | Val: %d",
+        len(df), len(df_train), len(df_test), len(df_val)
     )
     logger.info("  Features: %d cot", len(feature_cols_present))
     logger.info("  Horizons: %s ngay", FORECAST_DAYS)
@@ -851,12 +901,11 @@ def main():
         obs_pct = int(df["is_observed"].mean() * 100)
         logger.info("  Ty le diem thuc / tong: ~%d%%", obs_pct)
     logger.info(
-        "  [QUAN TRONG] Val (2023) chi dung cho EarlyStopping."
-        " Ket qua bao cao lay tu Test (2024+)."
+        "  [QUAN TRONG] Test (2023) chi dung cho EarlyStopping."
+        " Ket qua bao cao lay tu Val (2024+)."
     )
     logger.info("=" * 65)
     logger.info("\nBuoc 5 hoan thanh -- Chay tiep: python 06_bilstm_model.py")
-
 
 if __name__ == "__main__":
     main()

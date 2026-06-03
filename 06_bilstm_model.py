@@ -1,31 +1,12 @@
 """
-Bước 6: Huấn luyện và đánh giá mô hình Bi-LSTM
-==================================================
-Kiến trúc mô hình Bi-LSTM (v4.0):
-  Input(60, 26)
-  → BiLSTM(256, return_seq=True) → Dropout(0.25) → BatchNorm
-  → BiLSTM(128, return_seq=False) → Dropout(0.25) → BatchNorm
-  → Dense(64, relu, L2) → Dense(32, relu) → Dense(1, linear)
-
-Cải tiến so với v3.0:
-  1. Bi-LSTM thuần túy — không dùng Self-Attention (đúng tên đề tài)
-  2. Window mở rộng 30 → 60 ngày — bắt được chu kỳ mùa mưa/khô
-  3. LSTM units tăng [128,64] → [256,128] — tăng capacity mô hình
-  4. Huber Loss thay MSE — ít nhạy với đỉnh lũ cực trị
-  5. L2 regularization + Dropout 0.25 — chống overfitting tốt hơn
-  6. Bộ features mới (26 đặc trưng): thêm rain_30d, lag60, roll60, delta_h_7d/30d
-
-Bộ features (26 đặc trưng):
-  - Khí tượng    : rain_1d/3d/7d/14d/30d, temperature, humidity
-  - Lag mực nước : water_level_lag1/3/7/14/30/60
-  - Rolling stats : roll7/30/60, std7
-  - Temporal      : month_sin/cos, season_wet/dry
-  - Xu hướng     : delta_h_7d, delta_h_30d
-  - Q_out         : dH_dt_daily, Q_out_daily, Q_out_roll7
-
-Cửa sổ đầu vào : 60 ngày
-Đầu ra         : dự báo t+1, t+3, t+7, t+14, t+30 (m)
-Split          : Train(2017-2022) | Val(2023, EarlyStopping) | Test(2024-2025, báo cáo)
+Bước 6: Huấn luyện và đánh giá mô hình Bi-LSTM (v5.1 — chống overfitting)
+==========================================================================
+  - Bi-LSTM 2 chiều, 64 units/chiều (→ output 128), window 21 ngày
+  - Dự báo ΔH = H(t+d) - H(t), ghép lại H(t) khi inference
+  - 16 features (không có water_level_m — tránh học vẹt)
+  - sample_weight: quan trắc thật=1.0, nội suy/synthetic=0.25
+  - Ensemble với persistence (cấu hình ENSEMBLE_PERSISTENCE_WEIGHT)
+Split: Train(2019-2022) | Test(2023, EarlyStopping) | Val(2024+, báo cáo)
 """
 
 import os
@@ -42,13 +23,12 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 import tensorflow as tf
-from keras.models import Model
-from keras.layers import (
-    Input, Bidirectional, LSTM, Dense, Dropout,
-    BatchNormalization,
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, LSTM, Bidirectional, Dense, Dropout
 )
-from keras.regularizers import l2
-from keras.callbacks import (
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import (
     EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, CSVLogger,
 )
 from sklearn.metrics import mean_squared_error, mean_absolute_error, f1_score
@@ -68,47 +48,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# CẤU HÌNH SIÊU THAM SỐ (v4.0 — Bi-LSTM thuần túy)
-# ============================================================
-WINDOW_SIZE    = 60            # Cửa sổ nhìn lại (ngày) — 30 → 60 (bắt chu kỳ mùa)
-FORECAST_DAYS  = [1, 3, 7, 14, 30]
-BATCH_SIZE     = 32
-MAX_EPOCHS     = 300          # 200 → 300
-PATIENCE       = 20           # 15 → 20 (EarlyStopping kiên nhẫn hơn)
-LSTM_UNITS     = [256, 128]   # [128,64] → [256,128] (tăng capacity)
-DROPOUT_RATE   = 0.25         # 0.2 → 0.25
-L2_REG         = 1e-4         # L2 regularization cho Dense layers [MỚI]
-LEARNING_RATE  = 0.001
-MC_SAMPLES     = 50           # Số mẫu Monte Carlo Dropout
+from config import (
+    WINDOW_SIZE,
+    FORECAST_DAYS,
+    BATCH_SIZE,
+    MAX_EPOCHS,
+    PATIENCE,
+    MIN_DELTA_ES,
+    LSTM_UNITS,
+    USE_BIDIRECTIONAL,
+    RECURRENT_DROPOUT,
+    DROPOUT_RATE,
+    L2_REG,
+    LEARNING_RATE,
+    MC_SAMPLES,
+    FEATURE_COLS,
+    TARGET_COL,
+    BASE_LEVEL_COL,
+    PREDICT_DELTA_H,
+    ENSEMBLE_PERSISTENCE_WEIGHT,
+    ES_VAL_FRACTION,
+    SAMPLE_WEIGHT_FLOOD,
+    FLOOD_DELTA_THRESHOLD_M,
+    APPLY_LAG_D_ALIGNMENT,
+    TRAIN_CONFIG_PATH,
+    MNDBT,
+    target_delta_col,
+    target_abs_col,
+)
 
 os.makedirs("models",  exist_ok=True)
 os.makedirs("results", exist_ok=True)
-
-
-# ============================================================
-# FEATURE COLUMNS — 26 đặc trưng (v4.0, đồng bộ với 05_integrate.py)
-# ============================================================
-FEATURE_COLS = [
-    # Khí tượng (7 features)
-    "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
-    "temperature", "humidity",
-    # Lag mực nước (6 features)
-    "water_level_lag1", "water_level_lag3", "water_level_lag7",
-    "water_level_lag14", "water_level_lag30", "water_level_lag60",
-    # Rolling stats (4 features)
-    "water_level_roll7", "water_level_roll30", "water_level_roll60",
-    "water_level_std7",
-    # Temporal (4 features)
-    "month_sin", "month_cos", "season_wet", "season_dry",
-    # Xu hướng thủy văn (2 features)
-    "delta_h_7d", "delta_h_30d",
-    # Q_out (3 features)
-    "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
-]
-
-TARGET_COL = "water_level_m"
 
 
 # ============================================================
@@ -137,7 +107,7 @@ def validate_and_select_features(
     df_test: pd.DataFrame,
 ) -> tuple:
     """
-    Kiểm tra bộ dữ liệu có đủ 26 features (v4.0) không.
+    Kiểm tra bộ dữ liệu có đủ features (v5) không.
     """
     missing = [c for c in FEATURE_COLS if c not in df_train.columns]
     if missing:
@@ -145,7 +115,7 @@ def validate_and_select_features(
             f"Thiếu {len(missing)} cột đặc trưng trong dataset: {missing}\n"
             "Ảy chạy lại '05_integrate.py' để tạo đúng bộ dữ liệu."
         )
-    logger.info("✓ Đủ 26 đặc trưng ngày (v4.0).")
+    logger.info("✓ Đủ %d đặc trưng ngày (v5).", len(FEATURE_COLS))
     return df_train, df_val, df_test, FEATURE_COLS
 
 
@@ -159,82 +129,127 @@ def create_sequences(
     window_size: int,
 ) -> tuple:
     """
-    Tạo cặp (X, y) dạng cửa sổ trượt cho LSTM.
-
-    X[i] = features tại giờ [i-window_size .. i-1]
-    y[i] = target tại giờ i
-
-    Returns: X (n, window, features), y (n,), timestamps
+    Tạo (X, y, timestamps, base_levels, weights) cho LSTM.
+    Cửa sổ features kết thúc tại ngày i (gồm lag đến ngày i).
     """
-    features   = df[feature_cols].values
-    targets    = df[target_col].values
-    idx        = df.index
-    X, y, timestamps = [], [], []
+    features = df[feature_cols].values
+    targets  = df[target_col].values
+    bases    = df[BASE_LEVEL_COL].values
+    weights  = (
+        df["sample_weight"].values
+        if "sample_weight" in df.columns
+        else np.ones(len(df))
+    )
+    idx = df.index
+    X, y, timestamps, base_levels, sw = [], [], [], [], []
 
-    for i in range(window_size, len(df)):
-        X.append(features[i - window_size:i])
+    for i in range(window_size - 1, len(df)):
+        X.append(features[i - window_size + 1 : i + 1])
         y.append(targets[i])
         timestamps.append(idx[i])
+        base_levels.append(bases[i])
+        sw.append(weights[i])
 
-    return np.array(X), np.array(y), pd.DatetimeIndex(timestamps)
+    return (
+        np.array(X),
+        np.array(y),
+        pd.DatetimeIndex(timestamps),
+        np.array(base_levels),
+        np.array(sw),
+    )
 
 
 # ============================================================
-# KIẾN TRÚC MÔ HÌNH Bi-LSTM
+# KIẾN TRÚC MÔ HÌNH LSTM (v5)
 # ============================================================
 def build_bilstm(input_shape: tuple, lstm_units: list,
-                  dropout_rate: float) -> Model:
+                 dropout_rate: float) -> Model:
     """
-    Bi-LSTM 2 lớp thuần túy — kiến trúc chính của đề tài.
+    Kiến trúc Bi-LSTM (v5.1).
 
-    Lý do dùng Bi-LSTM cho bài toán thủy văn:
-      Bi-LSTM xử lý sequence theo cả 2 chiều (xuôi và ngược).
-      Chiều xuôi: học xu hướng tăng mực nước theo mưa tích lũy.
-      Chiều ngược: học bối cảnh thủy văn tương lai (như xu hướng giảm).
-      Kết hợp cả 2 chiều giúp mô hình nắm bắt tốt hơn tính tuần hoàn
-      mùa mưa/khô của hồ chứa.
+    Nếu USE_BIDIRECTIONAL = True (mặc định):
+      - Bi-LSTM: xử lý sequence cả hai chiều (forward + backward)
+      - Mỗi chiều: lstm_units[0] units → output ghép = 2 * lstm_units[0]
+      - Vận dụng: học các quy luật thủy văn có tính chu kỳ tốt hơn LSTM đơn hướng
 
-    Kiến trúc:
-      BiLSTM(256) → Dropout(0.25)
-      → BiLSTM(128) → Dropout(0.25)
-      → Dense(64, relu, L2) → Dense(32, relu) → Dense(1, linear)
+    Nếu USE_BIDIRECTIONAL = False (fallback):
+      - LSTM đơn hướng thông thường.
 
-    Parameters
-    ----------
-    input_shape : tuple
-        (window_size, n_features) ví dụ (60, 26)
-    lstm_units : list of int
-        Số unit LSTM lớp 1 và 2.
-    dropout_rate : float
-        Tỉ lệ Dropout.
-
-    Returns
-    -------
-    keras.Model
+    Đầu vào: (batch, WINDOW_SIZE, n_features)
+    Đầu ra: dự báo ΔH (scalar)
     """
     inputs = Input(shape=input_shape, name="input_sequence")
-
-    # ── Lớp BiLSTM 1: trích xuất đặc trưng chuỗi ────────────────────────
-    x = Bidirectional(
-        LSTM(lstm_units[0], return_sequences=True, name="bilstm_1"),
-        name="bidirectional_1",
-    )(inputs)
+    if USE_BIDIRECTIONAL:
+        x = Bidirectional(
+            LSTM(
+                lstm_units[0],
+                return_sequences=False,
+                recurrent_dropout=RECURRENT_DROPOUT,
+                name="lstm_fwd_bwd",
+            ),
+            merge_mode="concat",    # output dim = 2 * lstm_units[0]
+            name="bilstm_1",
+        )(inputs)
+    else:
+        x = LSTM(
+            lstm_units[0],
+            return_sequences=False,
+            recurrent_dropout=RECURRENT_DROPOUT,
+            name="lstm_1",
+        )(inputs)
     x = Dropout(dropout_rate, name="dropout_1")(x)
+    # Dense layer: input dim tự động phù hợp với cả Bi-LSTM (128) và LSTM (64)
+    x = Dense(32, activation="relu", kernel_regularizer=l2(L2_REG), name="dense_1")(x)
+    outputs = Dense(1, activation="linear", name="output")(x)
+    model_name = "BiLSTM_v51" if USE_BIDIRECTIONAL else "LSTM_v51"
+    return Model(inputs=inputs, outputs=outputs, name=model_name)
 
-    # ── Lớp BiLSTM 2: tổng hợp thành vector cố định ─────────────────
-    x = Bidirectional(
-        LSTM(lstm_units[1], return_sequences=False, name="bilstm_2"),
-        name="bidirectional_2",
-    )(x)
-    x = Dropout(dropout_rate, name="dropout_2")(x)
 
-    # ── Lớp Dense: ánh xạ sang không gian dự báo ──────────────────
-    x       = Dense(64, activation="relu", kernel_regularizer=l2(L2_REG),
-                    name="dense_1")(x)
-    x       = Dense(32, activation="relu", name="dense_2")(x)
-    outputs = Dense(1,  activation="linear", name="output")(x)
+def delta_to_level(
+    delta_m: np.ndarray,
+    base_m: np.ndarray,
+    target_scaler,
+) -> np.ndarray:
+    """Chuyển ΔH (scaled) → mực nước tuyệt đối (m)."""
+    if target_scaler is not None:
+        delta_m = target_scaler.inverse_transform(
+            delta_m.reshape(-1, 1)
+        ).flatten()
+    return base_m + delta_m
 
-    return Model(inputs=inputs, outputs=outputs, name="BiLSTM_v4")
+
+def blend_with_persistence(
+    pred_level: np.ndarray,
+    base_m: np.ndarray,
+    weight_persist: float = ENSEMBLE_PERSISTENCE_WEIGHT,
+) -> np.ndarray:
+    """Hợp nhất: w * H(t) + (1-w) * H_model."""
+    w = float(weight_persist)
+    return w * base_m + (1.0 - w) * pred_level
+
+
+def apply_lag_d_alignment(
+    df: pd.DataFrame,
+    horizon_d: int,
+    cols: list,
+) -> pd.DataFrame:
+    """
+    Hiệu chỉnh lệch d ngày (không đổi mô hình).
+
+    Khi mô hình gần persistence: pred(valid=T) ≈ H(T-d) thay vì H(T).
+    Dịch chuỗi dự báo NGƯỢC d ngày trên trục valid_time:
+        pred_aligned(T) = pred_raw(T + d)
+
+    Công thức pandas: shift(-d) trên index valid_time.
+    """
+    out = df.sort_values("valid_time").copy()
+    vt = pd.to_datetime(out["valid_time"])
+    for col in cols:
+        if col not in out.columns:
+            continue
+        s = pd.Series(out[col].values, index=vt)
+        out[f"{col}_aligned"] = s.shift(-horizon_d).reindex(vt).values
+    return out
 
 
 # ============================================================
@@ -307,12 +322,31 @@ def nash_sutcliffe_efficiency(y_true: np.ndarray,
 
 def evaluate_metrics(y_true: np.ndarray, y_pred: np.ndarray,
                      label: str = "") -> dict:
-    """Tính RMSE, MAE, NSE cho một tập dự báo."""
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    mae  = float(mean_absolute_error(y_true, y_pred))
-    nse  = nash_sutcliffe_efficiency(y_true, y_pred)
-    logger.info("  [%s] RMSE=%.4fm | MAE=%.4fm | NSE=%.4f", label, rmse, mae, nse)
-    return {"rmse": rmse, "mae": mae, "nse": nse}
+    """
+    Tính đầy đủ các chỉ số đánh giá — đáp ứng yêu cầu hội đồng và chuẩn WMO:
+      - RMSE  : Sại số căn trung bình bình phương
+      - MAE   : Sại số tuyệt đối trung bình
+      - R²    : Hệ số xác định (Coefficient of Determination)
+      - NSE   : Hệ số Nash-Sutcliffe (chuẩn vàng thủy văn học)
+      - PBIAS : Sai lệch phần trăm — Percent Bias (chuẩn WMO)
+    """
+    rmse  = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mae   = float(mean_absolute_error(y_true, y_pred))
+    nse   = nash_sutcliffe_efficiency(y_true, y_pred)
+
+    # R² (Coefficient of Determination) — được đề cập trong đề tài
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    r2 = float(1 - ss_res / ss_tot) if ss_tot != 0 else np.nan
+
+    # PBIAS (Percent Bias) — chuẩn WMO, dương = dự báo thiên cao, âm = thiên thấp
+    pbias = float(100.0 * np.sum(y_pred - y_true) / np.sum(y_true)) if np.sum(y_true) != 0 else np.nan
+
+    logger.info(
+        "  [%s] RMSE=%.4fm | MAE=%.4fm | R²=%.4f | NSE=%.4f | PBIAS=%.2f%%",
+        label, rmse, mae, r2, nse, pbias,
+    )
+    return {"rmse": rmse, "mae": mae, "r2": r2, "nse": nse, "pbias": pbias}
 
 
 # ============================================================
@@ -432,44 +466,74 @@ def train_and_evaluate(
     tuple
         (metrics_val, metrics_test, trained_model)
     """
-    target_col = f"target_t{horizon_d}d"
+    target_col = (
+        target_delta_col(horizon_d) if PREDICT_DELTA_H else target_abs_col(horizon_d)
+    )
+    abs_col = target_abs_col(horizon_d)
     model_path = f"models/bilstm_t{horizon_d}d.keras"
 
     logger.info("=" * 58)
-    logger.info("  HUẤN LUYỆN: t+%dd | %d features | Bi-LSTM", horizon_d, len(feature_cols))
+    logger.info(
+        "  HUẤN LUYỆN: t+%dd | %d features | LSTM v5 | target=%s",
+        horizon_d, len(feature_cols), target_col,
+    )
     logger.info("=" * 58)
 
-    # Kiểm tra cột target
     for name, split in [("train", df_train), ("val", df_val), ("test", df_test)]:
-        if target_col not in split.columns:
-            raise KeyError(
-                f"Thiếu cột '{target_col}' trong tập '{name}'.\n"
-                f"Chạy lại 05_integrate.py."
-            )
+        for col in (target_col, abs_col, BASE_LEVEL_COL):
+            if col not in split.columns:
+                raise KeyError(
+                    f"Thiếu cột '{col}' trong tập '{name}'.\nChạy lại 05_integrate.py."
+                )
 
-    # Tao sequences
-    # X_val  -> dung cho EarlyStopping + ReduceLR (khong dung de bao cao)
-    # X_test -> dung de tinh RMSE/MAE/NSE bao cao trong luan van
-    X_train, y_train, _        = create_sequences(df_train, feature_cols, target_col, WINDOW_SIZE)
-    X_val,   y_val,   _        = create_sequences(df_val,   feature_cols, target_col, WINDOW_SIZE)
-    X_test,  y_test,  ts_test  = create_sequences(df_test,  feature_cols, target_col, WINDOW_SIZE)
-    logger.info("  Train: %s | Val (EarlyStopping): %s | Test (Bao cao): %s",
-                X_train.shape, X_val.shape, X_test.shape)
+    X_train, y_train, ts_train, base_train, sw_train = create_sequences(
+        df_train, feature_cols, target_col, WINDOW_SIZE
+    )
+    # Tăng trọng số sự kiện biến động mạnh (|ΔH| lớn)
+    y_delta_raw = df_train.loc[ts_train, target_col].values
+    sw_train = sw_train * np.where(
+        np.abs(y_delta_raw) >= FLOOD_DELTA_THRESHOLD_M,
+        SAMPLE_WEIGHT_FLOOD,
+        1.0,
+    )
+    X_test, y_test, ts_test, base_test, sw_test = create_sequences(
+        df_test, feature_cols, target_col, WINDOW_SIZE
+    )
+    X_val, y_val, ts_val, base_val, sw_val = create_sequences(
+        df_val, feature_cols, target_col, WINDOW_SIZE
+    )
+    y_val_abs = df_val.loc[ts_val, abs_col].values
+    y_test_abs = df_test.loc[ts_test, abs_col].values
+
+    logger.info("  Train: %s | Test (EarlyStopping): %s | Val (Bao cao): %s",
+                X_train.shape, X_test.shape, X_val.shape)
 
     import joblib
-    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.preprocessing import StandardScaler
 
-    # Chuẩn hóa biến mục tiêu (Target Scaling) để tăng hiệu quả hội tụ
-    target_scaler = MinMaxScaler()
+    # Chuẩn hóa biến mục tiêu (Target Scaling) bằng StandardScaler thay vì MinMaxScaler.
+    # Lý do: MinMaxScaler ép mục tiêu về [0, 1]. Khi gặp bão Yagi (47.6m) cao hơn max của tập Train (46.8m),
+    # target sẽ vượt ra ngoài khoảng [0, 1] (Extrapolation). Mạng Neural rất khó dự báo vượt ngưỡng này.
+    # StandardScaler (z-score) không có biên cứng, giúp mô hình "thoáng" hơn trong việc ngoại suy đỉnh lũ.
+    target_scaler = StandardScaler()
     y_train_scaled = target_scaler.fit_transform(y_train.reshape(-1, 1)).flatten()
-    y_val_scaled = target_scaler.transform(y_val.reshape(-1, 1)).flatten()
+    y_test_scaled  = target_scaler.transform(y_test.reshape(-1, 1)).flatten()
+
+    # EarlyStopping: 85% đầu train = fit, 15% cuối = val nội bộ (cùng pipeline/scaler)
+    n_es = max(int(len(X_train) * ES_VAL_FRACTION), 1)
+    n_es = min(n_es, len(X_train) - 1)
+    X_fit, y_fit_s, sw_fit = X_train[:-n_es], y_train_scaled[:-n_es], sw_train[:-n_es]
+    X_es, y_es_s = X_train[-n_es:], y_train_scaled[-n_es:]
+    logger.info(
+        "  Fit: %s | ES-val (cuối train): %s | Test 2023 (báo cáo): %s",
+        X_fit.shape, X_es.shape, X_test.shape,
+    )
 
     # Lưu target scaler phục vụ API
     scaler_path = f"models/target_scaler_t{horizon_d}d.pkl"
     joblib.dump(target_scaler, scaler_path)
     logger.info("  [Scaler] Đã lưu target scaler: %s", scaler_path)
 
-    # Build model Bi-LSTM thuần túy
     model = build_bilstm(
         input_shape=(WINDOW_SIZE, len(feature_cols)),
         lstm_units=LSTM_UNITS,
@@ -486,8 +550,10 @@ def train_and_evaluate(
 
     # Callbacks
     callbacks = [
-        EarlyStopping(monitor="val_loss", patience=PATIENCE,
-                      restore_best_weights=True, verbose=1),
+        EarlyStopping(
+            monitor="val_loss", patience=PATIENCE, min_delta=MIN_DELTA_ES,
+            restore_best_weights=True, verbose=1,
+        ),
         ModelCheckpoint(model_path, monitor="val_loss",
                         save_best_only=True, verbose=0),
         ReduceLROnPlateau(monitor="val_loss", factor=0.5,
@@ -497,81 +563,143 @@ def train_and_evaluate(
 
     # Huấn luyện trên target đã chuẩn hóa
     history = model.fit(
-        X_train, y_train_scaled,
-        validation_data=(X_val, y_val_scaled),
+        X_fit, y_fit_s,
+        validation_data=(X_es, y_es_s),
         epochs=MAX_EPOCHS,
         batch_size=BATCH_SIZE,
+        sample_weight=sw_fit,
         callbacks=callbacks,
         verbose=1,
     )
 
-    # ── Dự báo tất định (deterministic) ────────────────────
-    y_pred_val_scaled = model.predict(X_val, verbose=0).flatten()
-    y_pred_val = target_scaler.inverse_transform(y_pred_val_scaled.reshape(-1, 1)).flatten()
-
     y_pred_test_det_scaled = model.predict(X_test, verbose=0).flatten()
-    y_pred_test_det = target_scaler.inverse_transform(y_pred_test_det_scaled.reshape(-1, 1)).flatten()
+    y_pred_val_det_scaled  = model.predict(X_val, verbose=0).flatten()
 
-    # ── Dự báo khoảng tin cậy với MC Dropout (Test set) ────────────────────
+    if PREDICT_DELTA_H:
+        y_pred_test_det = delta_to_level(y_pred_test_det_scaled, base_test, target_scaler)
+        y_pred_val_det  = delta_to_level(y_pred_val_det_scaled, base_val, target_scaler)
+    else:
+        y_pred_test_det = target_scaler.inverse_transform(
+            y_pred_test_det_scaled.reshape(-1, 1)
+        ).flatten()
+        y_pred_val_det = target_scaler.inverse_transform(
+            y_pred_val_det_scaled.reshape(-1, 1)
+        ).flatten()
+
+    y_pred_test_det = blend_with_persistence(y_pred_test_det, base_test)
+    y_pred_val_det  = blend_with_persistence(y_pred_val_det, base_val)
+
+    # ── Dự báo khoảng tin cậy với MC Dropout (Tập Kiểm định / Val set) ────────────────────
     logger.info("  [MC Dropout] Chay %d mau de uoc luong khoang tin cay...", MC_SAMPLES)
     # Lấy các mẫu dự báo dạng scaled
     mc_preds_scaled = np.stack([
-        model(X_test, training=True).numpy().flatten()
+        model(X_val, training=True).numpy().flatten()
         for _ in range(MC_SAMPLES)
     ], axis=0)  # shape: (MC_SAMPLES, n_data)
 
     # Nghịch đảo chuẩn hóa từng mẫu về mét
-    mc_preds_meters = np.stack([
-        target_scaler.inverse_transform(mc_preds_scaled[i].reshape(-1, 1)).flatten()
+    mc_levels = np.stack([
+        delta_to_level(mc_preds_scaled[i], base_val, target_scaler)
+        if PREDICT_DELTA_H
+        else target_scaler.inverse_transform(mc_preds_scaled[i].reshape(-1, 1)).flatten()
         for i in range(MC_SAMPLES)
-    ], axis=0)  # shape: (MC_SAMPLES, n_data)
-
-    # Tính độ lệch chuẩn trên đơn vị mét
-    std_pred_meters = mc_preds_meters.std(axis=0)
+    ], axis=0)
+    mc_levels = np.stack([
+        blend_with_persistence(mc_levels[i], base_val) for i in range(MC_SAMPLES)
+    ], axis=0)
+    std_pred_meters = mc_levels.std(axis=0)
 
     # Điểm dự báo chính (Point Forecast) là dự báo tất định (deterministic) để tối ưu NSE
-    y_pred_test_mean = y_pred_test_det
+    y_pred_val_mean = y_pred_val_det
 
     # Khoảng tin cậy 95% đối xứng quanh điểm dự báo tất định
-    y_pred_test_lo = y_pred_test_mean - 1.96 * std_pred_meters
-    y_pred_test_hi = y_pred_test_mean + 1.96 * std_pred_meters
+    y_pred_val_lo = y_pred_val_mean - 1.96 * std_pred_meters
+    y_pred_val_hi = y_pred_val_mean + 1.96 * std_pred_meters
+    
+    ci_width_mean = np.mean(y_pred_val_hi - y_pred_val_lo)
+    logger.info("  [MC Dropout] Mean CI width: %.2f m", ci_width_mean) # FIXED: Thêm log để theo dõi độ rộng trung bình của khoảng tin cậy.
 
-    # Danh gia trên đơn vị mét:
-    metrics_val  = evaluate_metrics(y_val, y_pred_val,
-                                    label=f"Val  (EarlyStopping) t+{horizon_d}d")
-    metrics_test = evaluate_metrics(y_test, y_pred_test_mean,
-                                    label=f"Test (Kiem dinh doc lap) t+{horizon_d}d")
+    metrics_test = evaluate_metrics(
+        y_test_abs, y_pred_test_det,
+        label=f"Test (EarlyStopping) t+{horizon_d}d",
+    )
+    metrics_val = evaluate_metrics(
+        y_val_abs, y_pred_val_mean,
+        label=f"Val  (Kiem dinh doc lap) t+{horizon_d}d",
+    )
 
-    # =============== ĐOẠN CODE BỔ SUNG: F1-SCORE ===============
-    MNDBT = 46.20
+    # Naive đúng cho horizon d: H(t+d) ≈ H(t) khi phát hành t
+    y_persist_val = base_val
+    metrics_persist = evaluate_metrics(
+        y_val_abs, y_persist_val,
+        label=f"Val  Naive H(t)→H(t+{horizon_d}d) t+{horizon_d}d",
+    )
+    metrics_val["nse_persistence"] = metrics_persist["nse"]
+    metrics_val["rmse_persistence"] = metrics_persist["rmse"]
+    logger.info(
+        "  [So sanh] NSE model=%.4f vs persistence=%.4f",
+        metrics_val["nse"], metrics_persist["nse"],
+    )
+
     XA_LU = 46.50
-    f1_mndbt = evaluate_threshold_f1(y_test, y_pred_test_mean, MNDBT)
-    f1_xalu  = evaluate_threshold_f1(y_test, y_pred_test_mean, XA_LU)
+    f1_mndbt = evaluate_threshold_f1(y_val_abs, y_pred_val_mean, MNDBT)
+    f1_xalu  = evaluate_threshold_f1(y_val_abs, y_pred_val_mean, XA_LU)
     
     logger.info(f"  [Metrics Thực Chiến] F1-Score tại MNDBT ({MNDBT}m): {f1_mndbt:.4f}")
     logger.info(f"  [Metrics Thực Chiến] F1-Score tại Ngưỡng Xả lũ ({XA_LU}m): {f1_xalu:.4f}")
     # Đẩy vào object metrics để visualize nếu cần
-    metrics_test["f1_mndbt"] = f1_mndbt
-    metrics_test["f1_xalu"] = f1_xalu
+    metrics_val["f1_mndbt"] = f1_mndbt
+    metrics_val["f1_xalu"] = f1_xalu
     # ============================================================
 
-    # Lưu kết quả
     df_result = pd.DataFrame({
-        "timestamp":    ts_test,
-        "actual":       y_test,
-        "predicted":    y_pred_test_mean,
-        "ci95_lower":   y_pred_test_lo,
-        "ci95_upper":   y_pred_test_hi,
-        "error":        y_pred_test_mean - y_test,
+        "issue_time":   ts_val,
+        "valid_time":   ts_val + pd.to_timedelta(horizon_d, unit="D"),
+        "actual":       y_val_abs,
+        "predicted":    y_pred_val_mean,
+        "persistence":  y_persist_val,
+        "ci95_lower":   y_pred_val_lo,
+        "ci95_upper":   y_pred_val_hi,
+        "error":        y_pred_val_mean - y_val_abs,
     })
+    if APPLY_LAG_D_ALIGNMENT:
+        df_result = apply_lag_d_alignment(
+            df_result,
+            horizon_d,
+            cols=["predicted", "ci95_lower", "ci95_upper"],
+        )
+        df_result["error_aligned"] = (
+            df_result["predicted_aligned"] - df_result["actual"]
+        )
+        mask = df_result["predicted_aligned"].notna()
+        if mask.sum() > 10:
+            m_al = evaluate_metrics(
+                df_result.loc[mask, "actual"].values,
+                df_result.loc[mask, "predicted_aligned"].values,
+                label=f"Val  Sau căn lệch d (t+{horizon_d}d)",
+            )
+            metrics_val["nse_aligned"] = m_al["nse"]
+            metrics_val["rmse_aligned"] = m_al["rmse"]
     df_result.to_csv(f"results/predictions_t{horizon_d}d.csv", index=False)
 
-    # Vẽ biểu đồ
-    plot_results(df_result, history, horizon_d, metrics_test, len(feature_cols))
+    plot_results(df_result, history, horizon_d, metrics_val, len(feature_cols))
 
     # SHAP (cho khoảng dự báo đầu tiên và cuối để tiết kiệm thời gian)
     if horizon_d in [1, 30]:
         compute_shap_importance(model, X_train, X_test, feature_cols, horizon_d)
+
+    if horizon_d == FORECAST_DAYS[0]:
+        train_cfg = {
+            "version": "5.0",
+            "predict_delta_h": PREDICT_DELTA_H,
+            "window_size": WINDOW_SIZE,
+            "feature_cols": FEATURE_COLS,
+            "ensemble_persistence_weight": ENSEMBLE_PERSISTENCE_WEIGHT,
+            "lstm_units": LSTM_UNITS,
+            "dropout_rate": DROPOUT_RATE,
+        }
+        with open(TRAIN_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(train_cfg, f, ensure_ascii=False, indent=2)
 
     return metrics_val, metrics_test, model
 
@@ -585,12 +713,22 @@ def plot_results(df_result: pd.DataFrame, history,
     """
     Vẽ 2 biểu đồ:
       1. Đường cong loss (train vs val)
-      2. Dự báo vs Thực tế + Khoảng tin cậy 95% (MC Dropout)
-         tại sự kiện lũ Yagi tháng 9/2024
+      2. Dự báo vs Thực tế theo valid_time (= issue_time + horizon)
+         — trục X là ngày mực nước được dự báo, tránh lệch 1 ngày trên đồ thị
     """
+    df_plot_src = df_result.copy()
+    if "valid_time" not in df_plot_src.columns:
+        issue_col = (
+            "issue_time" if "issue_time" in df_plot_src.columns else "timestamp"
+        )
+        df_plot_src["valid_time"] = (
+            pd.to_datetime(df_plot_src[issue_col])
+            + pd.to_timedelta(horizon_d, unit="D")
+        )
+    time_col = "valid_time"
     fig, axes = plt.subplots(2, 1, figsize=(14, 11))
     fig.suptitle(
-        f"Bi-LSTM | t+{horizon_d}d | {n_features} features\n"
+        f"LSTM v5 | t+{horizon_d}d | {n_features} features\n"
         f"RMSE={metrics['rmse']:.4f}m | MAE={metrics['mae']:.4f}m | NSE={metrics['nse']:.4f}",
         fontsize=12, fontweight="bold",
     )
@@ -599,36 +737,82 @@ def plot_results(df_result: pd.DataFrame, history,
     ax1 = axes[0]
     ax1.plot(history.history["loss"],     label="Train Loss", color="steelblue")
     ax1.plot(history.history["val_loss"], label="Val Loss",   color="orange")
-    ax1.set_xlabel("Epoch"); ax1.set_ylabel("MSE Loss")
-    ax1.set_title("Đường cong hội tụ (Training curve)")
+    ax1.set_xlabel("Epoch"); ax1.set_ylabel("Huber Loss (ΔH scaled)")
+    ax1.set_title(
+        "Đường cong hội tộ — Train (85% đầu) vs Val nội bộ (15% cuối train)\n"
+        "(Không dùng 2023 — tránh khe loss train/val giả)"
+    )
     ax1.legend(); ax1.grid(alpha=0.3)
 
-    # Biểu đồ 2: Dự báo vs Thực tế với khoảng tin cậy
+    # Biểu đồ 2: trục X = valid_time (ngày mực nước t+d), không phải ngày phát hành
     ax2 = axes[1]
     yagi_mask = (
-        (df_result["timestamp"] >= "2024-09-07")
-        & (df_result["timestamp"] <= "2024-09-15")
+        (df_plot_src[time_col] >= "2024-09-07")
+        & (df_plot_src[time_col] <= "2024-09-15")
     )
-    df_plot = df_result[yagi_mask] if yagi_mask.sum() >= 2 else df_result.tail(100)
+    df_plot = df_plot_src[yagi_mask] if yagi_mask.sum() >= 2 else df_plot_src.tail(100)
+    t_axis = df_plot[time_col]
 
-    ax2.plot(df_plot["timestamp"], df_plot["actual"],
-             label="Thực tế", color="royalblue", linewidth=2)
-    ax2.plot(df_plot["timestamp"], df_plot["predicted"],
-             label=f"Dự báo t+{horizon_d}d", color="tomato",
-             linewidth=1.5, linestyle="--")
+    ax2.plot(t_axis, df_plot["actual"],
+             label="Thực tế H(valid)", color="royalblue", linewidth=2)
 
-    # Khoảng tin cậy 95% từ MC Dropout
-    ax2.fill_between(
-        df_plot["timestamp"],
-        df_plot["ci95_lower"], df_plot["ci95_upper"],
-        alpha=0.20, color="tomato", label="Khoảng tin cậy 95% (MC Dropout)",
+    use_aligned = (
+        APPLY_LAG_D_ALIGNMENT
+        and "predicted_aligned" in df_plot.columns
+        and df_plot["predicted_aligned"].notna().any()
     )
+    if use_aligned:
+        ax2.plot(
+            t_axis, df_plot["predicted_aligned"],
+            label=f"Dự báo t+{horizon_d}d (đã căn lệch d ngày)",
+            color="tomato", linewidth=2.0,
+        )
+        ax2.plot(
+            t_axis, df_plot["predicted"],
+            label="Trước căn (raw)",
+            color="darkorange", linewidth=1.0, linestyle="--", alpha=0.55,
+        )
+        lo_col, hi_col = "ci95_lower_aligned", "ci95_upper_aligned"
+        if lo_col in df_plot.columns and df_plot[lo_col].notna().any():
+            ax2.fill_between(
+                t_axis, df_plot[lo_col], df_plot[hi_col],
+                alpha=0.20, color="tomato", label="CI95 (đã căn)",
+            )
+    else:
+        ax2.plot(
+            t_axis, df_plot["predicted"],
+            label=f"Dự báo t+{horizon_d}d",
+            color="tomato", linewidth=1.5, linestyle="--",
+        )
+        ax2.fill_between(
+            t_axis, df_plot["ci95_lower"], df_plot["ci95_upper"],
+            alpha=0.20, color="tomato", label="Khoảng tin cậy 95%",
+        )
+
+    if "persistence" in df_plot.columns:
+        ax2.plot(
+            t_axis, df_plot["persistence"],
+            label="Naive H(ngày phát hành)",
+            color="gray", linewidth=1.0, linestyle=":",
+        )
 
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
     ax2.xaxis.set_major_locator(mdates.DayLocator(interval=1 if len(df_plot) < 20 else 7))
     plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
-    ax2.set_xlabel("Thời gian"); ax2.set_ylabel("Mực nước (m)")
-    ax2.set_title("Dự báo vs Thực tế — Lũ Yagi tháng 9/2024\n(Vùng bóng: Khoảng tin cậy 95%)")
+    ax2.set_xlabel("Ngày mực nước được dự báo (valid time)")
+    ax2.set_ylabel("Mực nước (m)")
+    align_note = (
+        " — hiển thị đã căn lệch d (post-process)"
+        if use_aligned else ""
+    )
+    nse_al = metrics.get("nse_aligned")
+    sub = (
+        f"NSE (căn lệch)={nse_al:.4f} | " if nse_al is not None else ""
+    )
+    ax2.set_title(
+        f"Dự báo vs Thực tế — Lũ Yagi 9/2024 (t+{horizon_d}d){align_note}\n"
+        f"({sub}đường đỏ = pred_aligned, gạch cam = raw)"
+    )
     ax2.legend(); ax2.grid(alpha=0.3)
 
     plt.tight_layout()
@@ -647,26 +831,31 @@ def print_summary_table(all_metrics: dict) -> None:
     Chi bao cao chi so tren tap TEST (kiem dinh doc lap 2024-2025).
     Chi so Val chi hien thi de tham khao kiem tra overfitting.
     """
-    print("\n" + "=" * 74)
-    print("  BANG TONG HOP — Bi-LSTM (Ho Nui Coc)")
-    print("  [BAO CAO CHINH: Test 2024-2025 — bao gom lu Yagi 9/2024]")
-    print("=" * 74)
-    print(f"{'Khoang':>10} | {'RMSE (m)':>10} | {'MAE (m)':>10} | {'NSE':>8} | {'Danh gia':>10}")
-    print("-" * 74)
+    print("\n" + "=" * 90)
+    print("  BANG TONG HOP — Bi-LSTM v5.1 (Ho Nui Coc)")
+    print("  [BAO CAO CHINH: Val 2024-2025 — bao gom lu Yagi 9/2024]")
+    print("=" * 90)
+    print(
+        f"{'Khoang':>10} | {'RMSE':>8} | {'MAE':>8} | {'R2':>8} "
+        f"| {'NSE':>8} | {'NSE_pers':>8} | {'PBIAS%':>8} | {'Danh gia':>8}"
+    )
+    print("-" * 90)
 
     for d, (val_m, test_m) in all_metrics.items():
-        nse = test_m["nse"]
-        tag = "Tot" if nse >= 0.75 else ("Kha" if nse >= 0.60 else "Yeu")
+        nse   = val_m["nse"]
+        nse_p = val_m.get("nse_persistence", float("nan"))
+        r2    = val_m.get("r2", float("nan"))
+        pbias = val_m.get("pbias", float("nan"))
+        tag   = "Tot" if nse >= 0.75 else ("Kha" if nse >= 0.60 else "Yeu")
         print(
-            f"  t+{d:>2}d [Test] | "
-            f"{test_m['rmse']:>10.4f} | "
-            f"{test_m['mae']:>10.4f} | "
-            f"{nse:>8.4f} | {tag:>10}"
+            f"  t+{d:>2}d [Val ] | {val_m['rmse']:>8.4f} | {val_m['mae']:>8.4f} | {r2:>8.4f} "
+            f"| {nse:>8.4f} | {nse_p:>8.4f} | {pbias:>7.2f}% | {tag:>8}"
         )
-    print("=" * 74)
-    print("  Val (2023, EarlyStopping) metrics [chi tham khao overfitting]:")
+    print("=" * 90)
+    print("  Test (2023, EarlyStopping) metrics [chi tham khao overfitting]:")
     for d, (val_m, test_m) in all_metrics.items():
-        print(f"    t+{d:>2}d [Val ]: RMSE={val_m['rmse']:.4f}m  NSE={val_m['nse']:.4f}")
+        r2_t = test_m.get('r2', float('nan'))
+        print(f"    t+{d:>2}d [Test]: RMSE={test_m['rmse']:.4f}m  NSE={test_m['nse']:.4f}  R2={r2_t:.4f}")
 
     results_json = {f"t+{d}d": {"val": v, "test": t}
                     for d, (v, t) in all_metrics.items()}
@@ -680,8 +869,10 @@ def print_summary_table(all_metrics: dict) -> None:
 # ============================================================
 def main():
     logger.info("=" * 60)
-    logger.info("BƯỚC 6: HUẤN LUYỆN Bi-LSTM (v4.0)")
+    logger.info("BƯỚC 6: HUẤN LUYỆN Bi-LSTM (v5.1 — ΔH + anti-overfit + Bidirectional)")
     logger.info("Thời gian: %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    logger.info("Kiến trúc: %s | %d units/chiều | PATIENCE=%d",
+                "Bi-LSTM" if USE_BIDIRECTIONAL else "LSTM", LSTM_UNITS[0], PATIENCE)
     logger.info("=" * 60)
 
     tf.random.set_seed(42)
@@ -689,31 +880,33 @@ def main():
 
     logger.info("\n[Load] Doc du lieu tu data/final/ ...")
     df_train = load_dataset_csv("data/final/dataset_train.csv")
-    df_val   = load_dataset_csv("data/final/dataset_val.csv")
     df_test  = load_dataset_csv("data/final/dataset_test.csv")
+    df_val   = load_dataset_csv("data/final/dataset_val.csv")
 
-    logger.info("  Train (Calibration)       : %d ban ghi (%s -> %s)",
+    logger.info("  Train (Huan luyen)        : %d ban ghi (%s -> %s)",
                 len(df_train), df_train.index.min().date(), df_train.index.max().date())
-    logger.info("  Val   (EarlyStopping)     : %d ban ghi (%s -> %s)  <- khong bao cao",
-                len(df_val), df_val.index.min().date(), df_val.index.max().date())
-    logger.info("  Test  (Kiem dinh doc lap) : %d ban ghi (%s -> %s)  <- BAO CAO LUAN VAN",
+    logger.info("  Test  (EarlyStopping)     : %d ban ghi (%s -> %s)  <- dung som",
                 len(df_test), df_test.index.min().date(), df_test.index.max().date())
+    logger.info("  Val   (Kiem dinh doc lap) : %d ban ghi (%s -> %s)  <- BAO CAO LUAN VAN",
+                len(df_val), df_val.index.min().date(), df_val.index.max().date())
 
-    # Dam bao khong co data leakage: tap Val phai ket thuc truoc tap Test
-    assert df_val.index.max() < df_test.index.min(), (
-        f"DATA LEAKAGE: Val ket thuc {df_val.index.max().date()} "
-        f">= Test bat dau {df_test.index.min().date()}!"
+    # Dam bao khong co data leakage: tap Test phai ket thuc truoc tap Val
+    assert df_test.index.max() < df_val.index.min(), (
+        f"DATA LEAKAGE: Test ket thuc {df_test.index.max().date()} "
+        f">= Val bat dau {df_val.index.min().date()}!"
     )
 
     # Chọn feature set
-    df_train, df_val, df_test, feature_cols = validate_and_select_features(
-        df_train, df_val, df_test
+    df_train, df_test, df_val, feature_cols = validate_and_select_features(
+        df_train, df_test, df_val
     )
     logger.info("  Số features: %d", len(feature_cols))
 
     # Huấn luyện từng khoảng dự báo
     all_metrics = {}
     for d in FORECAST_DAYS:
+        # Chú ý: hàm train_and_evaluate định nghĩa arg thứ 3 là df_val, arg thứ 4 là df_test.
+        # Ở đây ta truyền df_val (2024-2025) vào arg df_val, df_test (2023) vào arg df_test.
         val_m, test_m, _ = train_and_evaluate(
             d, df_train, df_val, df_test, feature_cols
         )

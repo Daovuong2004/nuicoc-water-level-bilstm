@@ -21,8 +21,8 @@ Kết quả được lưu tại:
     results/baseline_comparison_rmse.png
     results/ablation_study.json
 
-Khoảng dự báo: t+1h, t+3h, t+6h, t+12h, t+24h
-Cửa sổ đầu vào: 48 giờ
+Khoảng dự báo: t+1d, t+3d, t+7d, t+14d, t+30d
+Cửa sổ đầu vào: 21 ngày
 Tập kiểm tra: Lũ Yagi tháng 9/2024
 """
 
@@ -85,12 +85,17 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CẤU HÌNH SIÊU THAM SỐ
 # ============================================================
-WINDOW_SIZE    = 60           # Số ngày nhìn lại (input sequence length) — đồng bộ 60 ngày
-FORECAST_DAYS  = [1, 3, 7, 14, 30]   # Các khoảng dự báo (ngày)
-BATCH_SIZE     = 32
-MAX_EPOCHS     = 200
-PATIENCE_ES    = 15           # EarlyStopping patience
-PATIENCE_LR    = 7            # ReduceLROnPlateau patience
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    ENSEMBLE_PERSISTENCE_WEIGHT,
+    WINDOW_SIZE, FORECAST_DAYS, FEATURE_COLS, BATCH_SIZE,
+    MAX_EPOCHS, PATIENCE, LSTM_UNITS, DROPOUT_RATE, L2_REG,
+    LEARNING_RATE, PREDICT_DELTA_H, BASE_LEVEL_COL,
+    target_delta_col, target_abs_col,
+)
+
+PATIENCE_ES = PATIENCE
+PATIENCE_LR = 7
 
 # Đặt seed toàn cục để tái lập kết quả
 tf.random.set_seed(42)
@@ -100,28 +105,7 @@ np.random.seed(42)
 os.makedirs("models",  exist_ok=True)
 os.makedirs("results", exist_ok=True)
 
-# ============================================================
-# FEATURE COLUMNS (26 đặc trưng — v4.0 Daily đồng bộ với 05_integrate.py)
-# ============================================================
-FEATURE_COLS = [
-    # Khí tượng (7 features)
-    "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
-    "temperature", "humidity",
-    # Lag mực nước (6 features)
-    "water_level_lag1", "water_level_lag3", "water_level_lag7",
-    "water_level_lag14", "water_level_lag30", "water_level_lag60",
-    # Rolling stats (4 features)
-    "water_level_roll7", "water_level_roll30", "water_level_roll60",
-    "water_level_std7",
-    # Temporal (4 features)
-    "month_sin", "month_cos", "season_wet", "season_dry",
-    # Xu hướng thủy văn (2 features)
-    "delta_h_7d", "delta_h_30d",
-    # Q_out (3 features)
-    "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
-]
-
-TARGET_COL = "water_level_m"   # Cột mực nước thực tế (m)
+TARGET_COL = "water_level_m"
 
 # Tên hiển thị và màu sắc cho từng mô hình trong biểu đồ
 MODEL_NAMES  = ["SARIMA", "LSTM", "GRU", "Bi-LSTM"]
@@ -205,8 +189,8 @@ def create_sequences(
     idx        = df.index
     X, y, timestamps = [], [], []
 
-    for i in range(window_size, len(df)):
-        X.append(features[i - window_size:i])
+    for i in range(window_size - 1, len(df)):
+        X.append(features[i - window_size + 1 : i + 1])
         y.append(targets[i])
         timestamps.append(idx[i])
 
@@ -321,12 +305,10 @@ def build_lstm_unidirectional(input_shape: tuple) -> Model:
     # Lớp LSTM thứ nhất — trích xuất đặc trưng theo chiều xuôi
     x = LSTM(128, return_sequences=True, name="lstm_1")(inputs)
     x = Dropout(0.2, name="dropout_1")(x)
-    x = BatchNormalization(name="bn_1")(x)
 
     # Lớp LSTM thứ hai — tổng hợp thành vector cố định
     x = LSTM(64, return_sequences=False, name="lstm_2")(x)
     x = Dropout(0.2, name="dropout_2")(x)
-    x = BatchNormalization(name="bn_2")(x)
 
     # Lớp Dense — ánh xạ sang không gian dự báo
     x       = Dense(32, activation="relu", name="dense_1")(x)
@@ -582,9 +564,9 @@ def plot_comparison_bar(
     """
     Vẽ grouped bar chart so sánh 4 mô hình trên từng khoảng dự báo.
 
-    Trục X : Khoảng dự báo (t+1h, t+3h, ..., t+24h)
+    Trục X : Khoảng dự báo (t+1d, t+3d, ..., t+30d)
     Trục Y : Giá trị chỉ số đánh giá (NSE hoặc RMSE)
-    4 nhóm : SARIMA (gray), LSTM (steelblue), Bi-LSTM (orange), Bi-LSTM+Attn (crimson)
+    4 nhóm : SARIMA (gray), LSTM (steelblue), GRU (orange), Bi-LSTM (crimson)
 
     Parameters
     ----------
@@ -820,7 +802,7 @@ def _print_ascii_table(all_results: dict) -> None:
                     best_nse   = nse
                     best_model = model_name
         tag = "✓ Tốt" if best_nse >= 0.75 else ("Khá" if best_nse >= 0.60 else "Yếu")
-        print(f"    t+{h:>2}h → {best_model or 'N/A':<15} NSE={best_nse:.4f}  [{tag}]")
+        print(f"    t+{h:>2}d → {best_model or 'N/A':<15} NSE={best_nse:.4f}  [{tag}]")
     print()
 
 
@@ -852,10 +834,9 @@ def main() -> None:
     # Train (2017-2022): Calibration
     # Val   (2023)     : EarlyStopping cho LSTM/Bi-LSTM baseline (khong bao cao)
     # Test  (2024+)    : Kiem dinh doc lap \u2014 BAO CAO chinh trong luan van
-    logger.info("\n[Load] Doc bo du lieu tu data/final/ ...")
     df_train = load_dataset_csv("data/final/dataset_train.csv")
-    df_val   = load_dataset_csv("data/final/dataset_val.csv")
-    df_test  = load_dataset_csv("data/final/dataset_test.csv")
+    df_test  = load_dataset_csv("data/final/dataset_test.csv")  # (2023)
+    df_val   = load_dataset_csv("data/final/dataset_val.csv")   # (2024-2025)
 
     logger.info(
         "  Train (Calibration)       : %d ban ghi (%s -> %s)",
@@ -873,10 +854,10 @@ def main() -> None:
         df_test.index.min().date(), df_test.index.max().date(),
     )
 
-    # Kiem tra data leakage: Val phai ket thuc TRUOC khi Test bat dau
-    assert df_val.index.max() < df_test.index.min(), (
-        f"DATA LEAKAGE: Val ket thuc {df_val.index.max().date()} "
-        f">= Test bat dau {df_test.index.min().date()}!"
+    # Kiem tra data leakage: Test phai ket thuc TRUOC khi Val bat dau
+    assert df_test.index.max() < df_val.index.min(), (
+        f"DATA LEAKAGE: Test ket thuc {df_test.index.max().date()} "
+        f">= Val bat dau {df_val.index.min().date()}!"
     )
     logger.info("  [OK] Khong co data leakage (Val < Test, khong chong cheo).")
 
@@ -903,36 +884,36 @@ def main() -> None:
     all_results = {h: {} for h in FORECAST_DAYS}
 
     for h in FORECAST_DAYS:
-        target_col = f"target_t{h}d"
+        target_col = target_delta_col(h) if PREDICT_DELTA_H else target_abs_col(h)
+        abs_col = target_abs_col(h)
         logger.info("\n%s", "─" * 60)
-        logger.info("  DỰ BÁO t+%dd", h)
+        logger.info("  DỰ BÁO t+%dd (target=%s)", h, target_col)
         logger.info("─" * 60)
 
-        # Kiểm tra cột target tồn tại
         for split_name, split_df in [
             ("train", df_train), ("val", df_val), ("test", df_test)
         ]:
-            if target_col not in split_df.columns:
-                raise KeyError(
-                    f"Cột '{target_col}' không có trong tập '{split_name}'.\n"
-                    f"Các target hiện có: "
-                    f"{[c for c in split_df.columns if c.startswith('target')]}"
-                )
+            for col in (target_col, abs_col, BASE_LEVEL_COL):
+                if col not in split_df.columns:
+                    raise KeyError(
+                        f"Cột '{col}' không có trong tập '{split_name}'."
+                    )
 
-        # Tạo sequences cho Keras models
-        X_train, y_train, _        = create_sequences(
+        X_train, y_train, _ = create_sequences(
             df_train, feature_cols, target_col, WINDOW_SIZE
         )
-        X_val, y_val, _            = create_sequences(
-            df_val,   feature_cols, target_col, WINDOW_SIZE
+        X_val, y_val, ts_val = create_sequences(
+            df_val, feature_cols, target_col, WINDOW_SIZE
         )
-        X_test, y_test, ts_test    = create_sequences(
-            df_test,  feature_cols, target_col, WINDOW_SIZE
+        X_test, y_test, _ = create_sequences(
+            df_test, feature_cols, target_col, WINDOW_SIZE
         )
+        y_val_abs = df_val.loc[ts_val, abs_col].values
+        base_val = df_val.loc[ts_val, BASE_LEVEL_COL].values
 
         # ── 3a. SARIMA ──────────────────────────────────────────
         logger.info("\n  → [1/4] SARIMA baseline...")
-        sarima_result = run_sarima_baseline(df_train, df_test, h)
+        sarima_result = run_sarima_baseline(df_train, df_val, h)
         if sarima_result is not None:
             y_true_s, y_pred_s = sarima_result
             all_results[h]["SARIMA"] = evaluate_metrics(
@@ -946,7 +927,7 @@ def main() -> None:
         from sklearn.preprocessing import MinMaxScaler
         target_scaler = MinMaxScaler()
         y_train_scaled = target_scaler.fit_transform(y_train.reshape(-1, 1)).flatten()
-        y_val_scaled = target_scaler.transform(y_val.reshape(-1, 1)).flatten()
+        y_test_scaled = target_scaler.transform(y_test.reshape(-1, 1)).flatten()
 
         # ── 3b. LSTM đơn chiều ──────────────────────────────────
         logger.info("\n  → [2/4] LSTM đơn chiều...")
@@ -956,14 +937,21 @@ def main() -> None:
         train_keras_model(
             model=lstm_model,
             X_train=X_train, y_train=y_train_scaled,
-            X_val=X_val,     y_val=y_val_scaled,
+            X_val=X_test,    y_val=y_test_scaled,
             model_name="lstm_uni",
             horizon_d=h,
         )
-        y_pred_lstm_scaled = lstm_model.predict(X_test, verbose=0).flatten()
-        y_pred_lstm = target_scaler.inverse_transform(y_pred_lstm_scaled.reshape(-1, 1)).flatten()
+        y_pred_lstm_scaled = lstm_model.predict(X_val, verbose=0).flatten()
+        d_lstm = target_scaler.inverse_transform(
+            y_pred_lstm_scaled.reshape(-1, 1)
+        ).flatten()
+        y_pred_lstm = (
+            base_val + d_lstm if PREDICT_DELTA_H else d_lstm
+        )
+        w = ENSEMBLE_PERSISTENCE_WEIGHT
+        y_pred_lstm = w * base_val + (1 - w) * y_pred_lstm
         all_results[h]["LSTM"] = evaluate_metrics(
-            y_test, y_pred_lstm, label=f"LSTM t+{h}d"
+            y_val_abs, y_pred_lstm, label=f"LSTM t+{h}d"
         )
 
         # ── 3c. GRU đơn chiều ─────────────────────────────
@@ -974,14 +962,18 @@ def main() -> None:
         train_keras_model(
             model=gru_model,
             X_train=X_train, y_train=y_train_scaled,
-            X_val=X_val,     y_val=y_val_scaled,
+            X_val=X_test,    y_val=y_test_scaled,
             model_name="gru_uni",
             horizon_d=h,
         )
-        y_pred_gru_scaled = gru_model.predict(X_test, verbose=0).flatten()
-        y_pred_gru = target_scaler.inverse_transform(y_pred_gru_scaled.reshape(-1, 1)).flatten()
+        y_pred_gru_scaled = gru_model.predict(X_val, verbose=0).flatten()
+        d_gru = target_scaler.inverse_transform(
+            y_pred_gru_scaled.reshape(-1, 1)
+        ).flatten()
+        y_pred_gru = base_val + d_gru if PREDICT_DELTA_H else d_gru
+        y_pred_gru = w * base_val + (1 - w) * y_pred_gru
         all_results[h]["GRU"] = evaluate_metrics(
-            y_test, y_pred_gru, label=f"GRU t+{h}d"
+            y_val_abs, y_pred_gru, label=f"GRU t+{h}d"
         )
 
         # ── 3d. Bi-LSTM (Đề xuất, load từ bước 06) ──────────
@@ -999,20 +991,24 @@ def main() -> None:
         else:
             try:
                 bilstm_model  = load_model(bilstm_model_path)
-                y_pred_bilstm_scaled = bilstm_model.predict(X_test, verbose=0).flatten()
+                y_pred_bilstm_scaled = bilstm_model.predict(X_val, verbose=0).flatten()
                 
                 # Nạp target scaler tương ứng từ bước 06 để nghịch đảo chuẩn hóa
                 import joblib
                 horizon_scaler_path = f"models/target_scaler_t{h}d.pkl"
                 if os.path.exists(horizon_scaler_path):
                     h_scaler = joblib.load(horizon_scaler_path)
-                    y_pred_bilstm = h_scaler.inverse_transform(y_pred_bilstm_scaled.reshape(-1, 1)).flatten()
+                    d_bi = h_scaler.inverse_transform(
+                        y_pred_bilstm_scaled.reshape(-1, 1)
+                    ).flatten()
                 else:
-                    logger.warning("  Không tìm thấy target scaler cho t+%dd → dùng scaler hiện tại", h)
-                    y_pred_bilstm = target_scaler.inverse_transform(y_pred_bilstm_scaled.reshape(-1, 1)).flatten()
-                    
+                    d_bi = target_scaler.inverse_transform(
+                        y_pred_bilstm_scaled.reshape(-1, 1)
+                    ).flatten()
+                y_pred_bilstm = base_val + d_bi if PREDICT_DELTA_H else d_bi
+                y_pred_bilstm = w * base_val + (1 - w) * y_pred_bilstm
                 all_results[h]["Bi-LSTM"] = evaluate_metrics(
-                    y_test, y_pred_bilstm, label=f"Bi-LSTM t+{h}d"
+                    y_val_abs, y_pred_bilstm, label=f"LSTM-de-xuat t+{h}d"
                 )
             except Exception as exc:
                 logger.error(
