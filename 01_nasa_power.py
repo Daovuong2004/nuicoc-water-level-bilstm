@@ -6,6 +6,7 @@ Tham số thu thập:
   - T2M         : Nhiệt độ không khí 2m (°C)
   - RH2M        : Độ ẩm tương đối 2m (%)
   - WS2M        : Tốc độ gió 2m (m/s)
+  - GWETTOP     : Độ ẩm đất bề mặt (top soil moisture) - dùng cho mô phỏng thủy văn
 
 Giai đoạn : 2020-01-01 → 2025-12-31
 Tọa độ    : Hồ Núi Cốc, Thái Nguyên (21.6833°N, 105.7167°E)
@@ -51,6 +52,7 @@ NASA_PARAMS = [
     "T2M",           # Nhiệt độ không khí 2m (°C)
     "RH2M",          # Độ ẩm tương đối 2m (%)
     "WS2M",          # Tốc độ gió 2m (m/s)
+    "GWETTOP",       # Độ ẩm đất bề mặt (phục vụ tính hệ số dòng chảy)
 ]
 
 # Cấu hình retry
@@ -211,8 +213,6 @@ def preprocess_nasa(df: pd.DataFrame) -> pd.DataFrame:
       2. Nội suy tuyến tính cho khoảng thiếu ≤ 6 giờ (limit=6)
       3. Clip mưa âm về 0 (vật lý không hợp lệ)
       4. Tính mưa tích lũy rolling (1h, 6h, 24h)
-      5. Đổi tên cột sang tiếng Anh thân thiện
-
     Parameters
     ----------
     df : pd.DataFrame
@@ -247,6 +247,7 @@ def preprocess_nasa(df: pd.DataFrame) -> pd.DataFrame:
         "T2M":         "temperature",
         "RH2M":        "humidity",
         "WS2M":        "wind_speed",
+        "GWETTOP":     "gwettop",
     })
 
     return df

@@ -1,0 +1,28 @@
+{
+  "version": "5.0",
+  "predict_delta_h": true,
+  "window_size": 21,
+  "feature_cols": [
+    "rain_1d",
+    "rain_3d",
+    "rain_7d",
+    "rain_14d",
+    "rain_30d",
+    "temperature",
+    "humidity",
+    "water_level_lag7",
+    "water_level_lag14",
+    "water_level_lag30",
+    "water_level_roll7",
+    "water_level_std7",
+    "month_sin",
+    "month_cos",
+    "season_wet",
+    "season_dry"
+  ],
+  "ensemble_persistence_weight": 0.0,
+  "lstm_units": [
+    64
+  ],
+  "dropout_rate": 0.5
+}

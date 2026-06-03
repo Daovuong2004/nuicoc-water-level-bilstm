@@ -7,7 +7,7 @@ Mô hình: Bi-LSTM với Monte Carlo Dropout
 
 Mô tả:
     Server cung cấp API REST để dự báo mực nước hồ Núi Cốc theo nhiều chân trời
-    thời gian (1h, 3h, 6h, 12h, 24h) dựa trên dữ liệu 48 giờ gần nhất.
+    thời gian (1d, 3d, 7d, 14d, 30d) dựa trên dữ liệu 21 ngày gần nhất.
     Kết quả bao gồm dự báo điểm, khoảng tin cậy 95% (Monte Carlo Dropout),
     và cảnh báo ngưỡng lũ.
 
@@ -45,8 +45,31 @@ import joblib
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from keras.models import Model, load_model  # type: ignore
-from keras.layers import Input, Bidirectional, LSTM, Dense, Dropout, BatchNormalization
+from keras.layers import Input, LSTM, Dense, Dropout
 from keras.regularizers import l2
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    FEATURE_COLS,
+    FEATURE_COUNT,
+    WINDOW_SIZE,
+    FORECAST_DAYS,
+    L2_REG,
+    DROPOUT_RATE,
+    LSTM_UNITS,
+    USE_BIDIRECTIONAL,
+    RECURRENT_DROPOUT,
+    MC_SAMPLES,
+    PREDICT_DELTA_H,
+    ENSEMBLE_PERSISTENCE_WEIGHT,
+    TRAIN_CONFIG_PATH,
+    MNDBT,
+    CANH_BAO,
+    NGUY_HIEM,
+    MODEL_DIR,
+    SCALER_PATH,
+)
 
 # ---------------------------------------------------------------------------
 # Cấu hình logging
@@ -58,88 +81,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger("api_serve")
 
-# ---------------------------------------------------------------------------
-# Hằng số: Đặc trưng đầu vào
-# ---------------------------------------------------------------------------
-# 26 đặc trưng ngày theo đúng thứ tự đã dùng khi huấn luyện model v4.0
-FEATURE_COLS = [
-    # Khí tượng (7 features)
-    "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
-    "temperature", "humidity",
-    # Lag mực nước (6 features)
-    "water_level_lag1", "water_level_lag3", "water_level_lag7",
-    "water_level_lag14", "water_level_lag30", "water_level_lag60",
-    # Rolling stats (4 features)
-    "water_level_roll7", "water_level_roll30", "water_level_roll60",
-    "water_level_std7",
-    # Temporal (4 features)
-    "month_sin", "month_cos", "season_wet", "season_dry",
-    # Xu hướng thủy văn (2 features)
-    "delta_h_7d", "delta_h_30d",
-    # Q_out (3 features)
-    "dH_dt_daily", "Q_out_daily", "Q_out_roll7",
-]
-
-# Số đặc trưng đầu vào
-FEATURE_COUNT = len(FEATURE_COLS)  # 26
-
-# Kích thước cửa sổ thời gian (ngày)
-WINDOW_SIZE = 60
-
-# Siêu tham số L2 regularization
-L2_REG = 1e-4
-
-# Các chân trời dự báo (ngày)
-FORECAST_DAYS = [1, 3, 7, 14, 30]
-
-# ---------------------------------------------------------------------------
-# Ngưỡng cảnh báo hồ Núi Cốc (đơn vị: mét)
-# ---------------------------------------------------------------------------
-MNDBT = 46.20       # Mực nước dâng bình thường (m)
-CANH_BAO = 46.80    # Ngưỡng cảnh báo — theo dõi liên tục, sẵn sàng xả (m)
-NGUY_HIEM = 47.40   # Ngưỡng nguy hiểm — mở toàn bộ cửa xả, sơ tán hạ lưu (m)
-
-# ---------------------------------------------------------------------------
-# Đường dẫn model và scaler
-# ---------------------------------------------------------------------------
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
-SCALER_PATH = os.path.join(MODEL_DIR, "feature_scaler_daily.pkl")
+# (FEATURE_COLS, WINDOW_SIZE, ... imported from config.py v5)
 
 
 # ---------------------------------------------------------------------------
 # Kiến trúc mô hình Bi-LSTM để rebuild cho MC Dropout
 # ---------------------------------------------------------------------------
-def build_bilstm(input_shape: tuple, lstm_units: list = [256, 128],
-                  dropout_rate: float = 0.25, mc_dropout: bool = False) -> Model:
+def build_bilstm(input_shape: tuple, mc_dropout: bool = False) -> Model:
+    """
+    Kiến trúc Bi-LSTM v5.1 — đồng bộ với 06_bilstm_model.py.
+
+    Bidirectional(LSTM(...), merge_mode='concat') → output dim = 2 * LSTM_UNITS[0]
+    Khi mc_dropout=True: Dropout layer bật training=True để dùng cho MC inference.
+    """
+    from keras.layers import Bidirectional  # đảm bảo import
     inputs = Input(shape=input_shape, name="input_sequence")
-
-    # ── Lớp BiLSTM 1 ──
-    x = Bidirectional(
-        LSTM(lstm_units[0], return_sequences=True, name="bilstm_1"),
-        name="bidirectional_1",
-    )(inputs)
-    if mc_dropout:
-        x = Dropout(dropout_rate, name="dropout_1")(x, training=True)
+    if USE_BIDIRECTIONAL:
+        x = Bidirectional(
+            LSTM(
+                LSTM_UNITS[0],
+                return_sequences=False,
+                recurrent_dropout=RECURRENT_DROPOUT,
+                name="lstm_fwd_bwd",
+            ),
+            merge_mode="concat",
+            name="bilstm_1",
+        )(inputs)
     else:
-        x = Dropout(dropout_rate, name="dropout_1")(x)
-
-    # ── Lớp BiLSTM 2 ──
-    x = Bidirectional(
-        LSTM(lstm_units[1], return_sequences=False, name="bilstm_2"),
-        name="bidirectional_2",
-    )(x)
+        x = LSTM(
+            LSTM_UNITS[0],
+            return_sequences=False,
+            recurrent_dropout=RECURRENT_DROPOUT,
+            name="lstm_1",
+        )(inputs)
     if mc_dropout:
-        x = Dropout(dropout_rate, name="dropout_2")(x, training=True)
+        x = Dropout(DROPOUT_RATE, name="dropout_1")(x, training=True)
     else:
-        x = Dropout(dropout_rate, name="dropout_2")(x)
-
-    # ── Lớp Dense ──
-    x       = Dense(64, activation="relu", kernel_regularizer=l2(L2_REG),
-                    name="dense_1")(x)
-    x       = Dense(32, activation="relu", name="dense_2")(x)
-    outputs = Dense(1,  activation="linear", name="output")(x)
-
-    return Model(inputs=inputs, outputs=outputs, name="BiLSTM_v4")
+        x = Dropout(DROPOUT_RATE, name="dropout_1")(x)
+    x = Dense(32, activation="relu", kernel_regularizer=l2(L2_REG), name="dense_1")(x)
+    outputs = Dense(1, activation="linear", name="output")(x)
+    model_name = "BiLSTM_v51" if USE_BIDIRECTIONAL else "LSTM_v51"
+    return Model(inputs=inputs, outputs=outputs, name=model_name)
 
 
 # ---------------------------------------------------------------------------
@@ -150,16 +132,15 @@ def load_models_and_scaler() -> tuple[dict, object, dict]:
     Tải toàn bộ model Bi-LSTM, feature scaler và các target scalers từ thư mục models/.
 
     Quy trình:
-        1. Load scaler (MinMaxScaler) từ models/feature_scaler_daily.pkl
-        2. Với mỗi chân trời d trong FORECAST_DAYS, load
+        1. Load StandardScaler (feature) từ models/feature_scaler_daily.pkl
+        2. Với mỗi chân trời d trong FORECAST_DAYS [1,3,7,14,30], load
            models/bilstm_t{d}d.keras (nếu tồn tại)
-        3. Load target scaler tương ứng từ models/target_scaler_t{d}d.pkl
+        3. Load target StandardScaler tương ứng từ models/target_scaler_t{d}d.pkl
         4. Model hoặc scaler bị thiếu sẽ bị bỏ qua và ghi log warning
-        5. Rebuild model với mc_dropout=True để sửa lỗi Dropout trong Keras
 
     Returns:
         models_dict (dict): {horizon_d: keras_model}
-        scaler: fitted MinMaxScaler hoặc None nếu không tìm thấy file
+        scaler: fitted StandardScaler hoặc None nếu không tìm thấy file
         target_scalers (dict): {horizon_d: target_scaler}
     """
     models_dict = {}
@@ -235,26 +216,25 @@ app_state: dict = {
 
 class ForecastRequest(BaseModel):
     """
-    Payload đầu vào cho endpoint POST /predict.
+    Payload đầu vào cho endpoint POST /predict (v5).
 
-    Attributes:
-        features:   Ma trận đặc trưng shape (60, 26) — dữ liệu 60 ngày gần nhất.
-                    Thứ tự cột phải khớp với FEATURE_COLS.
-        timestamp:  Thời điểm quan sát cuối cùng (ISO 8601), tùy chọn.
-                    Ví dụ: "2026-05-20T14:00:00+07:00"
+    features:      (WINDOW_SIZE, n_features) đã chuẩn hóa — thứ tự FEATURE_COLS.
+    base_level_m:  Mực nước H(t) tại ngày cuối (m, chưa scale) — ghép ΔH → H(t+d).
     """
     features: list[list[float]] = Field(
         ...,
-        description=(
-            "Ma trận đặc trưng shape (60, 26). "
-            "Hàng = bước thời gian (ngày), Cột = đặc trưng theo thứ tự FEATURE_COLS."
-        ),
-        example=[[0.0] * 26] * 60,
+        description=f"Ma trận ({WINDOW_SIZE}, {FEATURE_COUNT}) — đã StandardScaler.",
+        json_schema_extra={"example": [[0.0] * FEATURE_COUNT] * WINDOW_SIZE},
+    )
+    base_level_m: float = Field(
+        ...,
+        description="Mực nước thực tại thời điểm quan sát cuối H(t) (m)",
+        json_schema_extra={"example": 42.5},
     )
     timestamp: str | None = Field(
         default=None,
         description="Thời điểm quan sát cuối cùng (ISO 8601), tùy chọn.",
-        example="2026-05-20T14:00:00+07:00",
+        json_schema_extra={"example": "2026-05-20T14:00:00+07:00"},
     )
 
 
@@ -294,8 +274,9 @@ class HealthResponse(BaseModel):
 def predict_with_mc_dropout(
     model: Model,
     X_input: np.ndarray,
+    base_level_m: float,
     target_scaler: object = None,
-    n_samples: int = 50,
+    n_samples: int = MC_SAMPLES,
 ) -> tuple[float, float, float]:
     """
     Dự báo mực nước sử dụng kết hợp dự báo tất định và MC Dropout.
@@ -324,16 +305,27 @@ def predict_with_mc_dropout(
     mc_preds_scaled_batch = model(X_tiled, training=True)
     mc_preds_scaled = np.squeeze(mc_preds_scaled_batch.numpy())
 
-    # 3. Nghịch đảo chuẩn hóa về mét
     if target_scaler is not None:
-        mean_wl = float(np.squeeze(target_scaler.inverse_transform([[pred_scaled]])))
-        mc_preds_meters = target_scaler.inverse_transform(mc_preds_scaled.reshape(-1, 1)).flatten()
-        std_pred = float(np.std(mc_preds_meters))
+        delta_mean = float(np.squeeze(target_scaler.inverse_transform([[pred_scaled]])))
+        mc_delta = target_scaler.inverse_transform(
+            mc_preds_scaled.reshape(-1, 1)
+        ).flatten()
     else:
-        mean_wl = pred_scaled
-        std_pred = float(np.std(mc_preds_scaled))
+        delta_mean = pred_scaled
+        mc_delta = mc_preds_scaled
 
-    # Khoảng tin cậy 95%: mean ± 1.96 * std
+    if PREDICT_DELTA_H:
+        mean_wl = base_level_m + delta_mean
+        mc_levels = base_level_m + mc_delta
+    else:
+        mean_wl = delta_mean
+        mc_levels = mc_delta
+
+    w = ENSEMBLE_PERSISTENCE_WEIGHT
+    mean_wl = w * base_level_m + (1.0 - w) * mean_wl
+    mc_levels = w * base_level_m + (1.0 - w) * mc_levels
+
+    std_pred = float(np.std(mc_levels))
     ci95_lower = mean_wl - 1.96 * std_pred
     ci95_upper = mean_wl + 1.96 * std_pred
 
@@ -384,6 +376,27 @@ def determine_alert_level(max_water_level: float) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Lifespan: khởi động và dọn dẹp model (FastAPI v0.110+ hiện đại)
+# ---------------------------------------------------------------------------
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app_instance):  # noqa: ARG001
+    """
+    Context manager lifespan — thay thế @app.on_event('startup') đã deprecated.
+    Khởi động: tải toàn bộ model Bi-LSTM, feature scaler và target scalers.
+    """
+    logger.info("=== Khởi động hệ thống dự báo mực nước hồ Núi Cốc v5.1 ===")
+    models, scaler, target_scalers = load_models_and_scaler()
+    app_state["models"] = models
+    app_state["scaler"] = scaler
+    app_state["target_scalers"] = target_scalers
+    logger.info("=== Server sẵn sàng phục vụ ===")
+    yield   # ← server đang chạy
+    logger.info("=== Server đã dừng ===")
+
+
+# ---------------------------------------------------------------------------
 # Khởi tạo FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(
@@ -393,172 +406,554 @@ app = FastAPI(
         "Bi-LSTM với ước lượng bất định Monte Carlo Dropout. "
         "Hỗ trợ dự báo các chân trời 1d, 3d, 7d, 14d, 30d (tần suất Ngày)."
     ),
-    version="4.0",
+    version="5.1",
     contact={
         "name": "Đồ án tốt nghiệp",
         "url": "https://github.com/",
     },
     license_info={"name": "MIT"},
+    lifespan=lifespan,   # ← kết nối lifespan hiện đại
 )
 
 
 # ---------------------------------------------------------------------------
-# Route trang chủ HTML Dashboard
+# Endpoint mới: GET /forecast?date=YYYY-MM-DD  — tự đọc dataset, không cần nhập liệu
 # ---------------------------------------------------------------------------
 from fastapi.responses import HTMLResponse
+from typing import Optional
+
+@app.get(
+    "/forecast",
+    summary="Dự báo tự động từ dataset (không cần nhập liệu)",
+    description=(
+        "Server tự đọc 21 ngày dữ liệu từ dataset_full.csv kết thúc tại ngày chỉ định, "
+        "rồi trả về dự báo mực nước cho 5 chân trời. "
+        "Tham số date là tùy chọn, mặc định lấy ngày mới nhất trong dataset."
+    ),
+    tags=["Dự báo"],
+)
+async def forecast_from_date(date: Optional[str] = None) -> dict:
+    """
+    Endpoint đơn giản: chỉ cần truyền ngày (hoặc không truyền gì),
+    server tự lo phần còn lại.
+
+    Parameters
+    ----------
+    date : str, optional
+        Ngày kết thúc cửa sổ 21 ngày, định dạng YYYY-MM-DD.
+        Nếu bỏ trống → lấy ngày mới nhất trong dataset.
+
+    Returns
+    -------
+    dict với các trường:
+        issue_date   : ngày phát hành dự báo
+        base_level_m : mực nước H(t) tại ngày cuối window
+        forecasts    : danh sách dự báo 5 chân trời
+        alert_level  : mức cảnh báo
+        alert_message: thông điệp cảnh báo
+    """
+    import os
+    # Tìm file dataset
+    dataset_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data", "final", "dataset_full.csv",
+    )
+    if not os.path.exists(dataset_path):
+        raise HTTPException(
+            status_code=503,
+            detail="Không tìm thấy data/final/dataset_full.csv. Hãy chạy 05_integrate.py trước.",
+        )
+
+    import pandas as pd
+    df = pd.read_csv(dataset_path, index_col=0, parse_dates=True)
+    df.index = pd.to_datetime(df.index)
+
+    # Xác định ngày kết thúc window
+    if date:
+        try:
+            end_date = pd.Timestamp(date)
+        except Exception:
+            raise HTTPException(status_code=422, detail=f"Ngày không hợp lệ: {date}. Định dạng: YYYY-MM-DD")
+        avail = df.index[df.index <= end_date]
+        if len(avail) == 0:
+            raise HTTPException(status_code=422, detail=f"Không có dữ liệu trước ngày {date}.")
+        end_date = avail[-1]
+    else:
+        end_date = df.index[-1]
+
+    end_pos = df.index.get_loc(end_date)
+    if end_pos < WINDOW_SIZE - 1:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Không đủ {WINDOW_SIZE} ngày trước {end_date.date()}.",
+        )
+
+    # Kiểm tra features
+    missing = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing:
+        raise HTTPException(status_code=503, detail=f"Dataset thiếu cột: {missing}")
+
+    window        = df.iloc[end_pos - WINDOW_SIZE + 1 : end_pos + 1]
+    X_raw         = window[FEATURE_COLS].values.astype("float32")
+    base_level_m  = float(df.loc[end_date, "water_level_m"])
+    issue_date    = str(end_date.date())
+
+    # Kiểm tra scaler và models
+    scaler  = app_state["scaler"]
+    models  = app_state["models"]
+    if scaler is None:
+        raise HTTPException(status_code=503, detail="Scaler chưa được tải.")
+    if not models:
+        raise HTTPException(status_code=503, detail="Chưa có model nào được tải.")
+
+    X_scaled = scaler.transform(X_raw)
+    X_input  = X_scaled[np.newaxis, ...]          # (1, 21, 16)
+
+    forecasts   = []
+    models_used = []
+    for d in FORECAST_DAYS:
+        if d not in models:
+            continue
+        target_scaler = app_state["target_scalers"].get(d)
+        try:
+            mean_wl, ci_lo, ci_hi = predict_with_mc_dropout(
+                model=models[d],
+                X_input=X_input,
+                base_level_m=base_level_m,
+                target_scaler=target_scaler,
+            )
+        except Exception as exc:
+            logger.error("Lỗi forecast t%dd: %s", d, exc)
+            continue
+        forecasts.append({
+            "horizon_d":     d,
+            "water_level_m": round(mean_wl, 4),
+            "ci95_lower":    round(ci_lo,   4),
+            "ci95_upper":    round(ci_hi,   4),
+            "delta_m":       round(mean_wl - base_level_m, 4),
+        })
+        models_used.append(d)
+
+    if not forecasts:
+        raise HTTPException(status_code=503, detail="Không thể thực hiện dự báo.")
+
+    max_wl = max(f["water_level_m"] for f in forecasts)
+    alert_level, alert_message = determine_alert_level(max_wl)
+
+    return {
+        "issue_date":    issue_date,
+        "base_level_m":  round(base_level_m, 4),
+        "forecasts":     forecasts,
+        "models_used":   sorted(models_used),
+        "alert_level":   alert_level,
+        "alert_message": alert_message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Route trang chủ HTML Dashboard — tương tác đầy đủ
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="vi">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Hệ thống dự báo mực nước hồ Núi Cốc</title>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
-        <style>
-            body {
-                margin: 0;
-                font-family: 'Outfit', sans-serif;
-                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-                color: #f8fafc;
-                min-height: 100vh;
-                display: flex;
-                flex-direction: column;
-                justify-content: center;
-                align-items: center;
-                overflow-x: hidden;
-            }
-            .container {
-                max-width: 800px;
-                padding: 40px;
-                background: rgba(30, 41, 59, 0.7);
-                backdrop-filter: blur(16px);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 24px;
-                box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
-                text-align: center;
-                margin: 20px;
-                animation: fadeIn 0.8s ease-out;
-            }
-            @keyframes fadeIn {
-                from { opacity: 0; transform: translateY(20px); }
-                to { opacity: 1; transform: translateY(0); }
-            }
-            h1 {
-                font-size: 2.8rem;
-                font-weight: 800;
-                margin-bottom: 10px;
-                background: linear-gradient(to right, #38bdf8, #3b82f6);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-            }
-            p.tagline {
-                font-size: 1.1rem;
-                color: #94a3b8;
-                margin-bottom: 30px;
-                line-height: 1.6;
-            }
-            .grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 20px;
-                margin-bottom: 40px;
-            }
-            .card {
-                background: rgba(15, 23, 42, 0.5);
-                border: 1px solid rgba(255, 255, 255, 0.05);
-                padding: 20px;
-                border-radius: 16px;
-                transition: all 0.3s ease;
-            }
-            .card:hover {
-                transform: translateY(-5px);
-                border-color: rgba(56, 189, 248, 0.4);
-                box-shadow: 0 10px 20px rgba(56, 189, 248, 0.1);
-            }
-            .card-title {
-                font-weight: 600;
-                font-size: 1rem;
-                color: #38bdf8;
-                margin-bottom: 8px;
-            }
-            .card-desc {
-                font-size: 0.85rem;
-                color: #cbd5e1;
-            }
-            .btn {
-                display: inline-block;
-                padding: 14px 32px;
-                background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
-                color: white;
-                text-decoration: none;
-                font-weight: 600;
-                border-radius: 50px;
-                transition: all 0.3s ease;
-                box-shadow: 0 4px 15px rgba(2, 132, 199, 0.4);
-            }
-            .btn:hover {
-                transform: scale(1.05);
-                box-shadow: 0 6px 20px rgba(2, 132, 199, 0.6);
-                background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
-            }
-            .footer {
-                margin-top: 40px;
-                font-size: 0.8rem;
-                color: #64748b;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Hệ thống dự báo mực nước hồ Núi Cốc</h1>
-            <p class="tagline">API phục vụ dự báo mực nước hồ chứa sử dụng mô hình học máy nâng cao <strong>Bi-LSTM</strong> kết hợp ước lượng bất định Monte Carlo Dropout và cân bằng nước.</p>
-            
-            <div class="grid">
-                <div class="card">
-                    <div class="card-title">Cửa sổ đầu vào</div>
-                    <div class="card-desc">60 ngày liên tục gần nhất của 26 đặc trưng khí tượng thủy văn.</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">Chân trời dự báo</div>
-                    <div class="card-desc">Hỗ trợ các mốc thời gian: 1 ngày, 3 ngày, 7 ngày, 14 ngày và 30 ngày.</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">Độ không chắc chắn</div>
-                    <div class="card-desc">Khoảng tin cậy 95% mô phỏng qua 50 mẫu Monte Carlo Dropout.</div>
-                </div>
-            </div>
+    html_content = r"""
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dự báo mực nước hồ Núi Cốc</title>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Outfit', sans-serif;
+      background: #0b1120;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 24px 16px 48px;
+    }
+    /* ── Header ── */
+    .header {
+      text-align: center;
+      padding: 32px 0 24px;
+    }
+    .header h1 {
+      font-size: clamp(1.6rem, 4vw, 2.6rem);
+      font-weight: 800;
+      background: linear-gradient(90deg, #38bdf8, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      line-height: 1.2;
+    }
+    .header p {
+      margin-top: 8px;
+      color: #64748b;
+      font-size: .95rem;
+    }
+    /* ── Control panel ── */
+    .panel {
+      max-width: 740px;
+      margin: 0 auto 28px;
+      background: rgba(30,41,59,.75);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 20px;
+      padding: 28px 32px;
+      backdrop-filter: blur(14px);
+      box-shadow: 0 12px 40px rgba(0,0,0,.4);
+    }
+    .panel-title {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #94a3b8;
+      margin-bottom: 16px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .control-row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    label { font-size: .9rem; color: #94a3b8; }
+    input[type=date] {
+      flex: 1;
+      min-width: 160px;
+      padding: 12px 16px;
+      background: rgba(15,23,42,.8);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 12px;
+      color: #f1f5f9;
+      font-size: 1rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color .2s;
+    }
+    input[type=date]:focus { border-color: #38bdf8; }
+    .btn-predict {
+      padding: 12px 32px;
+      background: linear-gradient(135deg, #0ea5e9, #6366f1);
+      border: none;
+      border-radius: 12px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+      transition: all .25s;
+      box-shadow: 0 4px 18px rgba(14,165,233,.35);
+      white-space: nowrap;
+    }
+    .btn-predict:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(14,165,233,.5); }
+    .btn-predict:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+    /* ── Spinner ── */
+    .spinner {
+      display: none;
+      width: 22px; height: 22px;
+      border: 3px solid rgba(255,255,255,.2);
+      border-top-color: #38bdf8;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    /* ── Alert banner ── */
+    .alert-banner {
+      max-width: 740px;
+      margin: 0 auto 20px;
+      padding: 16px 24px;
+      border-radius: 14px;
+      font-weight: 600;
+      font-size: 1rem;
+      display: none;
+      animation: fadeSlide .4s ease-out;
+    }
+    @keyframes fadeSlide { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:none; } }
+    .alert-ok      { background: rgba(16,185,129,.15); border: 1px solid #10b981; color: #6ee7b7; }
+    .alert-warn    { background: rgba(245,158,11,.15);  border: 1px solid #f59e0b; color: #fcd34d; }
+    .alert-danger  { background: rgba(239,68,68,.15);   border: 1px solid #ef4444; color: #fca5a5; }
+    /* ── Results grid ── */
+    .results {
+      max-width: 740px;
+      margin: 0 auto;
+      display: none;
+    }
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 14px;
+      margin-bottom: 20px;
+    }
+    .kpi {
+      background: rgba(30,41,59,.7);
+      border: 1px solid rgba(255,255,255,.07);
+      border-radius: 16px;
+      padding: 18px 14px;
+      text-align: center;
+      transition: all .25s;
+    }
+    .kpi:hover { border-color: rgba(56,189,248,.35); transform: translateY(-3px); }
+    .kpi-label  { font-size: .75rem; color: #64748b; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+    .kpi-value  { font-size: 1.6rem; font-weight: 800; color: #f1f5f9; }
+    .kpi-unit   { font-size: .75rem; color: #94a3b8; margin-top: 2px; }
+    .kpi-delta  { font-size: .8rem; margin-top: 4px; }
+    .up   { color: #f87171; }
+    .down { color: #34d399; }
+    /* ── Chart card ── */
+    .chart-card {
+      background: rgba(30,41,59,.7);
+      border: 1px solid rgba(255,255,255,.07);
+      border-radius: 20px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    .chart-card h3 { font-size: 1rem; color: #94a3b8; margin-bottom: 16px; }
+    /* ── Info bar ── */
+    .info-bar {
+      display: flex;
+      gap: 24px;
+      flex-wrap: wrap;
+      background: rgba(15,23,42,.6);
+      border: 1px solid rgba(255,255,255,.06);
+      border-radius: 14px;
+      padding: 14px 20px;
+      font-size: .85rem;
+      color: #64748b;
+      margin-bottom: 20px;
+    }
+    .info-bar span b { color: #e2e8f0; }
+    /* ── Footer ── */
+    footer { text-align: center; margin-top: 36px; color: #334155; font-size: .78rem; }
+    footer a { color: #38bdf8; text-decoration: none; }
+    .error-msg { color: #f87171; text-align: center; padding: 12px; font-size: .9rem; display:none; }
+  </style>
+</head>
+<body>
 
-            <a href="/docs" class="btn">Mở Tài Liệu API (Swagger UI)</a>
-            
-            <div class="footer">
-                Đồ án Tốt nghiệp &copy; 2026 | Khoa Thủy văn - Thủy lợi
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+<div class="header">
+  <h1>🌊 Dự báo mực nước hồ Núi Cốc</h1>
+  <p>Bi-LSTM · Monte Carlo Dropout · 5 chân trời dự báo</p>
+</div>
+
+<!-- Control Panel -->
+<div class="panel">
+  <div class="panel-title">Chọn ngày phát hành dự báo</div>
+  <div class="control-row">
+    <label for="dateInput">📅 Ngày:</label>
+    <input type="date" id="dateInput" value="2025-12-28"
+           min="2017-01-22" max="2025-12-28">
+    <button class="btn-predict" id="btnPredict" onclick="runForecast()">
+      ⚡ Dự báo ngay
+    </button>
+    <div class="spinner" id="spinner"></div>
+  </div>
+</div>
+
+<!-- Alert Banner -->
+<div class="alert-banner" id="alertBanner"></div>
+<div class="error-msg" id="errorMsg"></div>
+
+<!-- Results -->
+<div class="results" id="results">
+  <div class="info-bar" id="infoBar"></div>
+  <div class="kpi-row" id="kpiRow"></div>
+  <div class="chart-card">
+    <h3>📈 Biểu đồ dự báo mực nước + Khoảng tin cậy 95%</h3>
+    <canvas id="forecastChart" height="90"></canvas>
+  </div>
+</div>
+
+<footer>
+  <a href="/docs">📖 Tài liệu API (Swagger UI)</a> &nbsp;·&nbsp;
+  <a href="/health">/health</a> &nbsp;·&nbsp;
+  <a href="/features">/features</a> &nbsp;·&nbsp;
+  Đồ án Tốt nghiệp © 2026
+</footer>
+
+<script>
+let chartInstance = null;
+
+async function runForecast() {
+  const date   = document.getElementById('dateInput').value;
+  const btn    = document.getElementById('btnPredict');
+  const spin   = document.getElementById('spinner');
+  const errEl  = document.getElementById('errorMsg');
+  const alert  = document.getElementById('alertBanner');
+  const results= document.getElementById('results');
+
+  btn.disabled = true;
+  spin.style.display = 'block';
+  errEl.style.display = 'none';
+  alert.style.display = 'none';
+  results.style.display = 'none';
+
+  try {
+    const url = date ? `/forecast?date=${date}` : '/forecast';
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    renderResults(data);
+  } catch(e) {
+    errEl.textContent = '⚠️ ' + e.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    spin.style.display = 'none';
+  }
+}
+
+function renderResults(data) {
+  // --- Alert banner ---
+  const alertEl = document.getElementById('alertBanner');
+  const cls = { 'BÌNH THƯỜNG': 'alert-ok', 'CẢNH BÁO': 'alert-warn', 'NGUY HIỂM': 'alert-danger' };
+  alertEl.className = 'alert-banner ' + (cls[data.alert_level] || 'alert-ok');
+  alertEl.innerHTML = data.alert_message;
+  alertEl.style.display = 'block';
+
+  // --- Info bar ---
+  document.getElementById('infoBar').innerHTML =
+    `<span>📅 Ngày dự báo: <b>${data.issue_date}</b></span>` +
+    `<span>💧 Mực nước H(t): <b>${data.base_level_m.toFixed(2)} m</b></span>` +
+    `<span>🤖 Models: <b>t+${data.models_used.join('d, t+')}d</b></span>`;
+
+  // --- KPI cards ---
+  const kpiRow = document.getElementById('kpiRow');
+  kpiRow.innerHTML = '';
+  const base = data.base_level_m;
+  data.forecasts.forEach(f => {
+    const d = f.horizon_d;
+    const wl = f.water_level_m.toFixed(3);
+    const delta = f.delta_m;
+    const sign  = delta >= 0 ? '▲' : '▼';
+    const cls   = delta >= 0 ? 'up' : 'down';
+    kpiRow.innerHTML += `
+      <div class="kpi">
+        <div class="kpi-label">t+${d} ngày</div>
+        <div class="kpi-value">${wl}</div>
+        <div class="kpi-unit">mét</div>
+        <div class="kpi-delta ${cls}">${sign}${Math.abs(delta).toFixed(3)} m</div>
+      </div>`;
+  });
+
+  // --- Chart ---
+  const labels  = data.forecasts.map(f => `t+${f.horizon_d}d`);
+  const vals    = data.forecasts.map(f => f.water_level_m);
+  const lowers  = data.forecasts.map(f => f.ci95_lower);
+  const uppers  = data.forecasts.map(f => f.ci95_upper);
+  const ciWidth = uppers.map((u, i) => u - lowers[i]);
+
+  if (chartInstance) chartInstance.destroy();
+  const ctx = document.getElementById('forecastChart').getContext('2d');
+  chartInstance = new Chart(ctx, {
+    data: {
+      labels,
+      datasets: [
+        {
+          type: 'bar',
+          label: 'CI 95% (độ rộng)',
+          data: ciWidth,
+          backgroundColor: 'rgba(99,102,241,.18)',
+          borderColor:     'rgba(99,102,241,.4)',
+          borderWidth: 1,
+          yAxisID: 'y2',
+          order: 2,
+        },
+        {
+          type: 'line',
+          label: 'Mực nước dự báo (m)',
+          data: vals,
+          borderColor:     '#38bdf8',
+          backgroundColor: 'rgba(56,189,248,.12)',
+          borderWidth: 3,
+          pointRadius: 7,
+          pointBackgroundColor: '#38bdf8',
+          fill: false,
+          tension: .35,
+          yAxisID: 'y',
+          order: 1,
+          z: 10,
+        },
+        {
+          type: 'line',
+          label: 'CI95 dưới (m)',
+          data: lowers,
+          borderColor: 'rgba(56,189,248,.3)',
+          borderWidth: 1.5,
+          borderDash: [4, 4],
+          pointRadius: 4,
+          fill: false,
+          yAxisID: 'y',
+          order: 3,
+        },
+        {
+          type: 'line',
+          label: 'CI95 trên (m)',
+          data: uppers,
+          borderColor: 'rgba(56,189,248,.3)',
+          borderWidth: 1.5,
+          borderDash: [4, 4],
+          pointRadius: 4,
+          fill: false,
+          yAxisID: 'y',
+          order: 4,
+        },
+        {
+          type: 'line',
+          label: `H(t)=${base.toFixed(2)}m`,
+          data: Array(labels.length).fill(base),
+          borderColor: 'rgba(251,191,36,.6)',
+          borderWidth: 1.5,
+          borderDash: [6, 3],
+          pointRadius: 0,
+          fill: false,
+          yAxisID: 'y',
+          order: 5,
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          labels: { color: '#94a3b8', font: { size: 11, family: 'Outfit' } }
+        },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const v = ctx.parsed.y;
+              if (v == null) return '';
+              return ` ${ctx.dataset.label}: ${v.toFixed(4)}`;
+            }
+          }
+        }
+      },
+      scales: {
+        x:  { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255,255,255,.05)' } },
+        y:  { ticks: { color: '#94a3b8', callback: v => v.toFixed(2)+'m' },
+               grid:  { color: 'rgba(255,255,255,.05)' },
+               title: { display: true, text: 'Mực nước (m)', color: '#64748b' } },
+        y2: { position: 'right', ticks: { color: '#6366f1', callback: v => v.toFixed(2)+'m' },
+               grid: { drawOnChartArea: false },
+               title: { display: true, text: 'Độ rộng CI95 (m)', color: '#6366f1' } },
+      }
+    }
+  });
+
+  document.getElementById('results').style.display = 'block';
+}
+
+// Chạy dự báo ngay khi tải trang
+window.addEventListener('load', runForecast);
+</script>
+</body>
+</html>
+"""
     return HTMLResponse(content=html_content, status_code=200)
-
-
-# ---------------------------------------------------------------------------
-# Sự kiện khởi động — tải model và scaler
-# ---------------------------------------------------------------------------
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    """
-    Hook khởi động FastAPI: tải toàn bộ model Bi-LSTM, feature scaler và target scalers.
-    Kết quả được lưu vào app_state để tái sử dụng trên mọi request.
-    """
-    logger.info("=== Khởi động hệ thống dự báo mực nước hồ Núi Cốc v4.0 ===")
-    models, scaler, target_scalers = load_models_and_scaler()
-    app_state["models"] = models
-    app_state["scaler"] = scaler
-    app_state["target_scalers"] = target_scalers
-    logger.info("=== Server sẵn sàng phục vụ ===")
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +965,7 @@ async def startup_event() -> None:
     response_model=ForecastResponse,
     summary="Dự báo mực nước hồ Núi Cốc",
     description=(
-        "Nhận ma trận đặc trưng 60×26 (60 ngày gần nhất, 26 đặc trưng ngày), "
+        f"Nhận ma trận đặc trưng {WINDOW_SIZE}×{FEATURE_COUNT} ({WINDOW_SIZE} ngày gần nhất, {FEATURE_COUNT} đặc trưng ngày), "
         "trả về dự báo mực nước cho các chân trời 1d, 3d, 7d, 14d, 30d "
         "kèm khoảng tin cậy 95% và mức cảnh báo lũ."
     ),
@@ -604,7 +999,9 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             detail="Chưa có model nào được tải. Kiểm tra thư mục models/.",
         )
 
-    # ---- Validate shape: phải là (60, 26) ----
+    base_level_m = request.base_level_m
+
+    # ---- Validate shape ----
     features_raw = request.features
     n_rows = len(features_raw)
     if n_rows != WINDOW_SIZE:
@@ -612,7 +1009,7 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             status_code=422,
             detail=(
                 f"Số bước thời gian không hợp lệ: nhận được {n_rows}, "
-                f"yêu cầu {WINDOW_SIZE} (60 ngày)."
+                f"yêu cầu {WINDOW_SIZE} ngày."
             ),
         )
     for i, row in enumerate(features_raw):
@@ -657,8 +1054,8 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             mean_wl, ci_lower, ci_upper = predict_with_mc_dropout(
                 model=model,
                 X_input=X_input,
+                base_level_m=base_level_m,
                 target_scaler=target_scaler,
-                n_samples=50,
             )
         except Exception as exc:
             logger.error("Lỗi khi dự báo t%dd: %s", d, exc)
@@ -722,9 +1119,9 @@ async def health() -> HealthResponse:
 
     Trả về:
         - status: 'ok' nếu đủ model và scaler, 'degraded' nếu thiếu
-        - models_loaded: danh sách chân trời (giờ) đã có model sẵn sàng
-        - feature_count: số đặc trưng đầu vào (18)
-        - window_size: kích thước cửa sổ thời gian (48)
+        - models_loaded: danh sách chân trời (ngày) đã có model sẵn sàng
+        - feature_count: số đặc trưng đầu vào (16)
+        - window_size: kích thước cửa sổ thời gian (21 ngày)
         - scaler_loaded: True nếu scaler đã tải thành công
     """
     models: dict = app_state["models"]
