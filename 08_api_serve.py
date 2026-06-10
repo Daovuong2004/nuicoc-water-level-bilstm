@@ -549,6 +549,197 @@ async def forecast_from_date(date: Optional[str] = None) -> dict:
         "alert_message": alert_message,
     }
 
+# ---------------------------------------------------------------------------
+# Endpoint: POST /forecast-realtime — Dự báo ngày THỰC TẾ (tương lai)
+# ---------------------------------------------------------------------------
+import math as _math
+
+class RealtimeRequest(BaseModel):
+    """Không cần nhập gì — server tự đọc dữ liệu mới nhất từ dataset."""
+    water_level_m: float | None = Field(
+        default=None,
+        description="Mực nước hồ (m). Bỏ trống = tự lấy từ dòng cuối dataset.",
+        json_schema_extra={"example": 42.5},
+    )
+    rain_today_mm: float | None = Field(
+        default=None,
+        description="Lượng mưa (mm). Bỏ trống = tự lấy từ dòng cuối dataset.",
+        json_schema_extra={"example": 5.0},
+    )
+    date: str | None = Field(
+        default=None,
+        description="Ngày dự báo (YYYY-MM-DD). Bỏ trống = ngày cuối cùng của dataset.",
+        json_schema_extra={"example": "2025-12-28"},
+    )
+
+
+@app.post(
+    "/forecast-realtime",
+    summary="⚡ Dự báo TƯƠNG LAI — bấm 1 nút, không cần nhập liệu",
+    description=(
+        "Không cần nhập gì! Server tự đọc mực nước + lượng mưa từ dữ liệu mới nhất, "
+        "xây dựng cửa sổ 21 ngày, và trả về dự báo t+1d, t+3d, t+7d, t+14d, t+30d "
+        "kèm ngày dự kiến cụ thể và khoảng tin cậy 95%."
+    ),
+    tags=["Dự báo"],
+)
+async def forecast_realtime(req: RealtimeRequest) -> dict:
+    # --- Tải dataset lịch sử (cần trước để auto-fill) ---
+    dataset_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data", "final", "dataset_full.csv",
+    )
+    if not os.path.exists(dataset_path):
+        raise HTTPException(status_code=503, detail="Không tìm thấy dataset_full.csv.")
+
+    df = pd.read_csv(dataset_path, index_col=0, parse_dates=True)
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    # --- Xác định ngày (mặc định = ngày cuối dataset) ---
+    if req.date:
+        try:
+            today = pd.Timestamp(req.date)
+        except Exception:
+            raise HTTPException(status_code=422, detail=f"Ngày không hợp lệ: {req.date}")
+    else:
+        today = pd.Timestamp.now().normalize()
+
+    # Tìm hàng dữ liệu khả dụng gần nhất trước hoặc bằng ngày today
+    avail_rows = df.loc[:today]
+    if len(avail_rows) == 0:
+        raise HTTPException(status_code=422, detail=f"Không tìm thấy dữ liệu lịch sử trước ngày {today.date()}.")
+    active_row = avail_rows.iloc[-1]
+
+    # --- Auto-fill từ dataset nếu không nhập ---
+    active_wl = active_row["water_level_m"]
+    if pd.isna(active_wl):
+        active_wl = 39.50
+    active_rain = active_row.get("rain_1d", 0.0)
+    if pd.isna(active_rain):
+        active_rain = 0.0
+
+    H_today    = req.water_level_m if req.water_level_m is not None else float(active_wl)
+    rain_today = max(0.0, req.rain_today_mm) if req.rain_today_mm is not None else float(active_rain)
+    month      = today.month
+
+    hist = avail_rows.tail(60).copy()
+
+    # --- Climatology theo tháng ---
+    clim_temp = float(df[df.index.month == month]["temperature"].mean()) if "temperature" in df.columns else 25.0
+    clim_humi = float(df[df.index.month == month]["humidity"].mean()) if "humidity" in df.columns else 80.0
+    if np.isnan(clim_temp):
+        clim_temp = 25.0
+    if np.isnan(clim_humi):
+        clim_humi = 80.0
+
+    # --- Water level lag features ---
+    def wl_lag(days: int) -> float:
+        target = today - pd.Timedelta(days=days)
+        avail = hist.index[hist.index <= target]
+        return float(hist.loc[avail[-1], "water_level_m"]) if len(avail) > 0 else H_today
+
+    lag7 = wl_lag(7)
+    lag14 = wl_lag(14)
+    lag30 = wl_lag(30)
+
+    # --- Rolling water level ---
+    recent7_vals = hist["water_level_m"].values[-6:].tolist() + [H_today]
+    roll7 = float(np.mean(recent7_vals))
+    std7 = float(np.std(recent7_vals))
+
+    # --- Rainfall tích lũy ---
+    def rain_sum(days: int) -> float:
+        start = today - pd.Timedelta(days=days - 1)
+        window_rain = hist[hist.index >= start]["rain_1d"].sum() if "rain_1d" in hist.columns else 0.0
+        return float(window_rain) + rain_today
+
+    # --- Month encoding ---
+    month_sin = _math.sin(2 * _math.pi * month / 12)
+    month_cos = _math.cos(2 * _math.pi * month / 12)
+    season_wet = 1.0 if month in [5, 6, 7, 8, 9, 10] else 0.0
+
+    # --- Hàng đặc trưng hôm nay ---
+    today_row = {
+        "rain_1d": rain_today, "rain_3d": rain_sum(3),
+        "rain_7d": rain_sum(7), "rain_14d": rain_sum(14),
+        "rain_30d": rain_sum(30), "temperature": clim_temp,
+        "humidity": clim_humi, "water_level_lag7": lag7,
+        "water_level_lag14": lag14, "water_level_lag30": lag30,
+        "water_level_roll7": roll7, "water_level_std7": std7,
+        "month_sin": month_sin, "month_cos": month_cos,
+        "season_wet": season_wet, "season_dry": 1.0 - season_wet,
+        "water_level_m": H_today,
+    }
+
+    # --- Ghép cửa sổ 21 ngày: 20 ngày lịch sử + hôm nay ---
+    hist20 = hist.tail(WINDOW_SIZE - 1)
+    today_df = pd.DataFrame([today_row], index=[today])
+    window_df = pd.concat([hist20, today_df]).tail(WINDOW_SIZE)
+
+    missing = [c for c in FEATURE_COLS if c not in window_df.columns]
+    if missing:
+        raise HTTPException(status_code=503, detail=f"Thiếu features: {missing}")
+
+    X_raw = window_df[FEATURE_COLS].values.astype("float32")
+    scaler = app_state["scaler"]
+    models = app_state["models"]
+    if scaler is None:
+        raise HTTPException(status_code=503, detail="Scaler chưa được tải.")
+    if not models:
+        raise HTTPException(status_code=503, detail="Chưa có model nào được tải.")
+
+    X_scaled = scaler.transform(X_raw)
+    X_input = X_scaled[np.newaxis, ...]
+
+    forecasts = []
+    models_used = []
+    for d in FORECAST_DAYS:
+        if d not in models:
+            continue
+        target_scaler = app_state["target_scalers"].get(d)
+        try:
+            mean_wl, ci_lo, ci_hi = predict_with_mc_dropout(
+                model=models[d], X_input=X_input,
+                base_level_m=H_today, target_scaler=target_scaler,
+            )
+        except Exception as exc:
+            logger.error("Lỗi realtime forecast t%dd: %s", d, exc)
+            continue
+        forecasts.append({
+            "horizon_d": d,
+            "forecast_date": str((today + pd.Timedelta(days=d)).date()),
+            "water_level_m": round(mean_wl, 4),
+            "ci95_lower": round(ci_lo, 4),
+            "ci95_upper": round(ci_hi, 4),
+            "delta_m": round(mean_wl - H_today, 4),
+        })
+        models_used.append(d)
+
+    if not forecasts:
+        raise HTTPException(status_code=503, detail="Không thể thực hiện dự báo.")
+
+    max_wl = max(f["water_level_m"] for f in forecasts)
+    alert_level, alert_message = determine_alert_level(max_wl)
+
+    logger.info(
+        "Realtime forecast: %s | H(t)=%.2fm | mưa=%.1fmm | %d chân trời",
+        today.date(), H_today, rain_today, len(forecasts),
+    )
+    return {
+        "issue_date": str(today.date()),
+        "base_level_m": round(H_today, 4),
+        "rain_today_mm": round(rain_today, 2),
+        "forecasts": forecasts,
+        "models_used": sorted(models_used),
+        "alert_level": alert_level,
+        "alert_message": alert_message,
+        "note": (
+            f"Dự báo từ H(t)={H_today:.2f}m ngày {today.date()}. "
+            f"Nhiệt độ/độ ẩm ước tính theo khí hậu tháng {month}."
+        ),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Route trang chủ HTML Dashboard — tương tác đầy đủ
@@ -562,398 +753,259 @@ async def root():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Dự báo mực nước hồ Núi Cốc</title>
+  <title>Dự báo mực nước hồ Núi Cốc — Bi-LSTM</title>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Outfit', sans-serif;
-      background: #0b1120;
-      color: #e2e8f0;
-      min-height: 100vh;
-      padding: 24px 16px 48px;
-    }
-    /* ── Header ── */
-    .header {
-      text-align: center;
-      padding: 32px 0 24px;
-    }
-    .header h1 {
-      font-size: clamp(1.6rem, 4vw, 2.6rem);
-      font-weight: 800;
-      background: linear-gradient(90deg, #38bdf8, #818cf8);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      line-height: 1.2;
-    }
-    .header p {
-      margin-top: 8px;
-      color: #64748b;
-      font-size: .95rem;
-    }
-    /* ── Control panel ── */
-    .panel {
-      max-width: 740px;
-      margin: 0 auto 28px;
-      background: rgba(30,41,59,.75);
-      border: 1px solid rgba(255,255,255,.08);
-      border-radius: 20px;
-      padding: 28px 32px;
-      backdrop-filter: blur(14px);
-      box-shadow: 0 12px 40px rgba(0,0,0,.4);
-    }
-    .panel-title {
-      font-size: 1rem;
-      font-weight: 600;
-      color: #94a3b8;
-      margin-bottom: 16px;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-    }
-    .control-row {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-    label { font-size: .9rem; color: #94a3b8; }
-    input[type=date] {
-      flex: 1;
-      min-width: 160px;
-      padding: 12px 16px;
-      background: rgba(15,23,42,.8);
-      border: 1px solid rgba(255,255,255,.12);
-      border-radius: 12px;
-      color: #f1f5f9;
-      font-size: 1rem;
-      font-family: inherit;
-      outline: none;
-      transition: border-color .2s;
-    }
-    input[type=date]:focus { border-color: #38bdf8; }
-    .btn-predict {
-      padding: 12px 32px;
-      background: linear-gradient(135deg, #0ea5e9, #6366f1);
-      border: none;
-      border-radius: 12px;
-      color: #fff;
-      font-size: 1rem;
-      font-weight: 700;
-      font-family: inherit;
-      cursor: pointer;
-      transition: all .25s;
-      box-shadow: 0 4px 18px rgba(14,165,233,.35);
-      white-space: nowrap;
-    }
-    .btn-predict:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(14,165,233,.5); }
-    .btn-predict:disabled { opacity: .5; cursor: not-allowed; transform: none; }
-    /* ── Spinner ── */
-    .spinner {
-      display: none;
-      width: 22px; height: 22px;
-      border: 3px solid rgba(255,255,255,.2);
-      border-top-color: #38bdf8;
-      border-radius: 50%;
-      animation: spin .7s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    /* ── Alert banner ── */
-    .alert-banner {
-      max-width: 740px;
-      margin: 0 auto 20px;
-      padding: 16px 24px;
-      border-radius: 14px;
-      font-weight: 600;
-      font-size: 1rem;
-      display: none;
-      animation: fadeSlide .4s ease-out;
-    }
-    @keyframes fadeSlide { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:none; } }
-    .alert-ok      { background: rgba(16,185,129,.15); border: 1px solid #10b981; color: #6ee7b7; }
-    .alert-warn    { background: rgba(245,158,11,.15);  border: 1px solid #f59e0b; color: #fcd34d; }
-    .alert-danger  { background: rgba(239,68,68,.15);   border: 1px solid #ef4444; color: #fca5a5; }
-    /* ── Results grid ── */
-    .results {
-      max-width: 740px;
-      margin: 0 auto;
-      display: none;
-    }
-    .kpi-row {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-      gap: 14px;
-      margin-bottom: 20px;
-    }
-    .kpi {
-      background: rgba(30,41,59,.7);
-      border: 1px solid rgba(255,255,255,.07);
-      border-radius: 16px;
-      padding: 18px 14px;
-      text-align: center;
-      transition: all .25s;
-    }
-    .kpi:hover { border-color: rgba(56,189,248,.35); transform: translateY(-3px); }
-    .kpi-label  { font-size: .75rem; color: #64748b; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
-    .kpi-value  { font-size: 1.6rem; font-weight: 800; color: #f1f5f9; }
-    .kpi-unit   { font-size: .75rem; color: #94a3b8; margin-top: 2px; }
-    .kpi-delta  { font-size: .8rem; margin-top: 4px; }
-    .up   { color: #f87171; }
-    .down { color: #34d399; }
-    /* ── Chart card ── */
-    .chart-card {
-      background: rgba(30,41,59,.7);
-      border: 1px solid rgba(255,255,255,.07);
-      border-radius: 20px;
-      padding: 24px;
-      margin-bottom: 20px;
-    }
-    .chart-card h3 { font-size: 1rem; color: #94a3b8; margin-bottom: 16px; }
-    /* ── Info bar ── */
-    .info-bar {
-      display: flex;
-      gap: 24px;
-      flex-wrap: wrap;
-      background: rgba(15,23,42,.6);
-      border: 1px solid rgba(255,255,255,.06);
-      border-radius: 14px;
-      padding: 14px 20px;
-      font-size: .85rem;
-      color: #64748b;
-      margin-bottom: 20px;
-    }
-    .info-bar span b { color: #e2e8f0; }
-    /* ── Footer ── */
-    footer { text-align: center; margin-top: 36px; color: #334155; font-size: .78rem; }
-    footer a { color: #38bdf8; text-decoration: none; }
-    .error-msg { color: #f87171; text-align: center; padding: 12px; font-size: .9rem; display:none; }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Outfit',sans-serif;background:#0b1120;color:#e2e8f0;min-height:100vh;padding:24px 16px 48px}
+    .header{text-align:center;padding:32px 0 20px}
+    .header h1{font-size:clamp(1.5rem,4vw,2.5rem);font-weight:800;background:linear-gradient(90deg,#38bdf8,#818cf8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1.2}
+    .header p{margin-top:6px;color:#64748b;font-size:.9rem}
+    .tabs{display:flex;justify-content:center;gap:4px;margin-bottom:24px}
+    .tab-btn{padding:10px 28px;border:1px solid rgba(255,255,255,.1);border-radius:12px;background:rgba(30,41,59,.6);color:#94a3b8;font-size:.95rem;font-weight:600;font-family:inherit;cursor:pointer;transition:all .2s}
+    .tab-btn.active{background:linear-gradient(135deg,#0ea5e9,#6366f1);color:#fff;border-color:transparent;box-shadow:0 4px 18px rgba(14,165,233,.35)}
+    .tab-btn:hover:not(.active){border-color:rgba(56,189,248,.4);color:#e2e8f0}
+    .tab-content{display:none}.tab-content.active{display:block}
+    .panel{max-width:740px;margin:0 auto 24px;background:rgba(30,41,59,.75);border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:24px 28px;backdrop-filter:blur(14px);box-shadow:0 12px 40px rgba(0,0,0,.4)}
+    .panel-title{font-size:.95rem;font-weight:600;color:#94a3b8;margin-bottom:14px;text-transform:uppercase;letter-spacing:.04em}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+    .form-group{display:flex;flex-direction:column;gap:4px}
+    .form-group label{font-size:.8rem;color:#64748b}
+    .form-group input{padding:10px 14px;background:rgba(15,23,42,.8);border:1px solid rgba(255,255,255,.12);border-radius:10px;color:#f1f5f9;font-size:1rem;font-family:inherit;outline:none;transition:border-color .2s}
+    .form-group input:focus{border-color:#38bdf8}
+    .form-group .unit{font-size:.75rem;color:#475569;margin-top:2px}
+    .control-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    input[type=date]{flex:1;min-width:160px;padding:10px 14px;background:rgba(15,23,42,.8);border:1px solid rgba(255,255,255,.12);border-radius:10px;color:#f1f5f9;font-size:1rem;font-family:inherit;outline:none;transition:border-color .2s}
+    input[type=date]:focus{border-color:#38bdf8}
+    .btn-predict{padding:10px 28px;background:linear-gradient(135deg,#0ea5e9,#6366f1);border:none;border-radius:10px;color:#fff;font-size:.95rem;font-weight:700;font-family:inherit;cursor:pointer;transition:all .25s;box-shadow:0 4px 18px rgba(14,165,233,.35);white-space:nowrap}
+    .btn-predict:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(14,165,233,.5)}
+    .btn-predict:disabled{opacity:.5;cursor:not-allowed;transform:none}
+    .spinner{display:none;width:20px;height:20px;border:3px solid rgba(255,255,255,.2);border-top-color:#38bdf8;border-radius:50%;animation:spin .7s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .alert-banner{max-width:740px;margin:0 auto 16px;padding:14px 20px;border-radius:12px;font-weight:600;font-size:.95rem;display:none;animation:fadeSlide .4s ease-out}
+    @keyframes fadeSlide{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+    .alert-ok{background:rgba(16,185,129,.15);border:1px solid #10b981;color:#6ee7b7}
+    .alert-warn{background:rgba(245,158,11,.15);border:1px solid #f59e0b;color:#fcd34d}
+    .alert-danger{background:rgba(239,68,68,.15);border:1px solid #ef4444;color:#fca5a5}
+    .results{max-width:740px;margin:0 auto;display:none}
+    .kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:12px;margin-bottom:18px}
+    .kpi{background:rgba(30,41,59,.7);border:1px solid rgba(255,255,255,.07);border-radius:14px;padding:16px 12px;text-align:center;transition:all .25s}
+    .kpi:hover{border-color:rgba(56,189,248,.35);transform:translateY(-3px)}
+    .kpi-label{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+    .kpi-date{font-size:.72rem;color:#818cf8;margin-bottom:4px;font-weight:600}
+    .kpi-value{font-size:1.5rem;font-weight:800;color:#f1f5f9}
+    .kpi-unit{font-size:.7rem;color:#94a3b8;margin-top:1px}
+    .kpi-delta{font-size:.78rem;margin-top:3px}
+    .up{color:#f87171} .down{color:#34d399}
+    .chart-card{background:rgba(30,41,59,.7);border:1px solid rgba(255,255,255,.07);border-radius:18px;padding:20px;margin-bottom:18px}
+    .chart-card h3{font-size:.95rem;color:#94a3b8;margin-bottom:14px}
+    .info-bar{display:flex;gap:20px;flex-wrap:wrap;background:rgba(15,23,42,.6);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:12px 16px;font-size:.82rem;color:#64748b;margin-bottom:16px}
+    .info-bar span b{color:#e2e8f0}
+    footer{text-align:center;margin-top:30px;color:#334155;font-size:.76rem}
+    footer a{color:#38bdf8;text-decoration:none}
+    .error-msg{color:#f87171;text-align:center;padding:10px;font-size:.88rem;display:none}
+    .note-bar{max-width:740px;margin:0 auto 14px;padding:10px 16px;background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.25);border-radius:10px;font-size:.82rem;color:#a5b4fc;display:none}
   </style>
 </head>
 <body>
-
 <div class="header">
   <h1>🌊 Dự báo mực nước hồ Núi Cốc</h1>
   <p>Bi-LSTM · Monte Carlo Dropout · 5 chân trời dự báo</p>
 </div>
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('realtime')">⚡ Dự báo tương lai</button>
+  <button class="tab-btn" onclick="switchTab('history')">📂 Tra cứu lịch sử</button>
+</div>
+<!-- TAB 1: DỰ BÁO TƯƠNG LAI -->
+<div class="tab-content active" id="tab-realtime">
+  <div class="panel">
+    <div class="panel-title">Dự báo mực nước tương lai</div>
+    <p style="color:#94a3b8;font-size:.88rem;margin-bottom:16px;line-height:1.5">
+      Hệ thống tự động đọc <b style="color:#38bdf8">mực nước</b> và <b style="color:#38bdf8">lượng mưa</b>
+      từ dữ liệu quan trắc mới nhất trong dataset.<br>
+      Chỉ cần bấm nút bên dưới để nhận kết quả dự báo cho <b style="color:#818cf8">5 chân trời</b> tương lai.
+    </p>
+    <div class="control-row">
+      <button class="btn-predict" id="btnRealtime" onclick="runRealtime()" style="font-size:1.05rem;padding:14px 36px">
+        ⚡ Dự báo tương lai
+      </button>
+      <div class="spinner" id="spinRealtime"></div>
+    </div>
 
-<!-- Control Panel -->
-<div class="panel">
-  <div class="panel-title">Chọn ngày phát hành dự báo</div>
-  <div class="control-row">
-    <label for="dateInput">📅 Ngày:</label>
-    <input type="date" id="dateInput" value="2025-12-28"
-           min="2017-01-22" max="2025-12-28">
-    <button class="btn-predict" id="btnPredict" onclick="runForecast()">
-      ⚡ Dự báo ngay
-    </button>
-    <div class="spinner" id="spinner"></div>
+    <!-- Cấu hình giả lập kịch bản (Tùy chọn) -->
+    <div style="margin-top:20px;border-top:1px solid rgba(255,255,255,.06);padding-top:16px">
+      <div onclick="toggleConfig()" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;font-size:.85rem;color:#64748b;user-select:none;font-weight:600">
+        <span>⚙️ Thiết lập kịch bản giả lập (Tùy chọn nâng cao)</span>
+        <span id="configToggleIcon" style="transition:transform .2s">▼</span>
+      </div>
+      <div id="configFields" style="display:none;margin-top:16px">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="wlInput">Mực nước hiện tại H(t) (m):</label>
+            <input type="number" id="wlInput" step="0.01" placeholder="Mặc định: 39.50" min="30" max="50">
+            <span class="unit">Mặc định lấy từ dữ liệu thực tế mới nhất</span>
+          </div>
+          <div class="form-group">
+            <label for="rainInput">Lượng mưa ngày hôm nay (mm):</label>
+            <input type="number" id="rainInput" step="0.1" placeholder="Mặc định: 0.04" min="0" max="500">
+            <span class="unit">Lượng mưa trong ngày dự báo</span>
+          </div>
+        </div>
+        <div class="form-grid" style="grid-template-columns:1fr">
+          <div class="form-group">
+            <label for="customDateInput">Ngày dự báo:</label>
+            <input type="date" id="customDateInput" min="2017-01-22">
+            <span class="unit">Ngày bắt đầu dự báo (Mặc định: Ngày hôm nay)</span>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
-
-<!-- Alert Banner -->
+<!-- TAB 2: TRA CỨU LỊCH SỬ -->
+<div class="tab-content" id="tab-history">
+  <div class="panel">
+    <div class="panel-title">Chọn ngày tra cứu từ dữ liệu lịch sử (2017–2025)</div>
+    <div class="control-row">
+      <label for="dateInput">📅 Ngày:</label>
+      <input type="date" id="dateInput" value="2025-12-28" min="2017-01-22" max="2025-12-28">
+      <button class="btn-predict" id="btnHistory" onclick="runHistory()">🔍 Tra cứu</button>
+      <div class="spinner" id="spinHistory"></div>
+    </div>
+  </div>
+</div>
+<div class="note-bar" id="noteBar"></div>
 <div class="alert-banner" id="alertBanner"></div>
 <div class="error-msg" id="errorMsg"></div>
-
-<!-- Results -->
 <div class="results" id="results">
   <div class="info-bar" id="infoBar"></div>
   <div class="kpi-row" id="kpiRow"></div>
   <div class="chart-card">
     <h3>📈 Biểu đồ dự báo mực nước + Khoảng tin cậy 95%</h3>
-    <canvas id="forecastChart" height="90"></canvas>
+    <canvas id="forecastChart" height="85"></canvas>
   </div>
 </div>
-
 <footer>
-  <a href="/docs">📖 Tài liệu API (Swagger UI)</a> &nbsp;·&nbsp;
+  <a href="/docs">📖 Tài liệu API</a> &nbsp;·&nbsp;
   <a href="/health">/health</a> &nbsp;·&nbsp;
   <a href="/features">/features</a> &nbsp;·&nbsp;
   Đồ án Tốt nghiệp © 2026
 </footer>
-
 <script>
 let chartInstance = null;
-
-async function runForecast() {
-  const date   = document.getElementById('dateInput').value;
-  const btn    = document.getElementById('btnPredict');
-  const spin   = document.getElementById('spinner');
-  const errEl  = document.getElementById('errorMsg');
-  const alert  = document.getElementById('alertBanner');
-  const results= document.getElementById('results');
-
-  btn.disabled = true;
-  spin.style.display = 'block';
-  errEl.style.display = 'none';
-  alert.style.display = 'none';
-  results.style.display = 'none';
-
-  try {
-    const url = date ? `/forecast?date=${date}` : '/forecast';
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.detail || `HTTP ${resp.status}`);
-    }
-    const data = await resp.json();
-    renderResults(data);
-  } catch(e) {
-    errEl.textContent = '⚠️ ' + e.message;
-    errEl.style.display = 'block';
-  } finally {
-    btn.disabled = false;
-    spin.style.display = 'none';
+document.addEventListener("DOMContentLoaded", () => {
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, '0');
+  const dd = String(today.getDate()).padStart(2, '0');
+  document.getElementById('customDateInput').value = `${yyyy}-${mm}-${dd}`;
+});
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach((b,i) =>
+    b.classList.toggle('active', (tab==='realtime'&&i===0)||(tab==='history'&&i===1)));
+  document.getElementById('tab-realtime').classList.toggle('active', tab==='realtime');
+  document.getElementById('tab-history').classList.toggle('active', tab==='history');
+  ['results','alertBanner','noteBar','errorMsg'].forEach(id =>
+    document.getElementById(id).style.display='none');
+}
+function toggleConfig() {
+  const fields = document.getElementById('configFields');
+  const icon = document.getElementById('configToggleIcon');
+  if(fields.style.display === 'none') {
+    fields.style.display = 'block';
+    icon.textContent = '▲';
+  } else {
+    fields.style.display = 'none';
+    icon.textContent = '▼';
   }
 }
+async function runRealtime() {
+  const btn=document.getElementById('btnRealtime');
+  const spin=document.getElementById('spinRealtime');
+  btn.disabled=true;spin.style.display='block';hideAll();
+  
+  const bodyData = {};
+  const wlVal = document.getElementById('wlInput').value;
+  const rainVal = document.getElementById('rainInput').value;
+  const dateVal = document.getElementById('customDateInput').value;
+  
+  if (wlVal !== "") bodyData.water_level_m = parseFloat(wlVal);
+  if (rainVal !== "") bodyData.rain_today_mm = parseFloat(rainVal);
+  if (dateVal !== "") bodyData.date = dateVal;
 
-function renderResults(data) {
-  // --- Alert banner ---
-  const alertEl = document.getElementById('alertBanner');
-  const cls = { 'BÌNH THƯỜNG': 'alert-ok', 'CẢNH BÁO': 'alert-warn', 'NGUY HIỂM': 'alert-danger' };
-  alertEl.className = 'alert-banner ' + (cls[data.alert_level] || 'alert-ok');
-  alertEl.innerHTML = data.alert_message;
-  alertEl.style.display = 'block';
-
-  // --- Info bar ---
-  document.getElementById('infoBar').innerHTML =
-    `<span>📅 Ngày dự báo: <b>${data.issue_date}</b></span>` +
-    `<span>💧 Mực nước H(t): <b>${data.base_level_m.toFixed(2)} m</b></span>` +
-    `<span>🤖 Models: <b>t+${data.models_used.join('d, t+')}d</b></span>`;
-
-  // --- KPI cards ---
-  const kpiRow = document.getElementById('kpiRow');
-  kpiRow.innerHTML = '';
-  const base = data.base_level_m;
-  data.forecasts.forEach(f => {
-    const d = f.horizon_d;
-    const wl = f.water_level_m.toFixed(3);
-    const delta = f.delta_m;
-    const sign  = delta >= 0 ? '▲' : '▼';
-    const cls   = delta >= 0 ? 'up' : 'down';
-    kpiRow.innerHTML += `
-      <div class="kpi">
-        <div class="kpi-label">t+${d} ngày</div>
-        <div class="kpi-value">${wl}</div>
-        <div class="kpi-unit">mét</div>
-        <div class="kpi-delta ${cls}">${sign}${Math.abs(delta).toFixed(3)} m</div>
-      </div>`;
-  });
-
-  // --- Chart ---
-  const labels  = data.forecasts.map(f => `t+${f.horizon_d}d`);
-  const vals    = data.forecasts.map(f => f.water_level_m);
-  const lowers  = data.forecasts.map(f => f.ci95_lower);
-  const uppers  = data.forecasts.map(f => f.ci95_upper);
-  const ciWidth = uppers.map((u, i) => u - lowers[i]);
-
-  if (chartInstance) chartInstance.destroy();
-  const ctx = document.getElementById('forecastChart').getContext('2d');
-  chartInstance = new Chart(ctx, {
-    data: {
-      labels,
-      datasets: [
-        {
-          type: 'bar',
-          label: 'CI 95% (độ rộng)',
-          data: ciWidth,
-          backgroundColor: 'rgba(99,102,241,.18)',
-          borderColor:     'rgba(99,102,241,.4)',
-          borderWidth: 1,
-          yAxisID: 'y2',
-          order: 2,
-        },
-        {
-          type: 'line',
-          label: 'Mực nước dự báo (m)',
-          data: vals,
-          borderColor:     '#38bdf8',
-          backgroundColor: 'rgba(56,189,248,.12)',
-          borderWidth: 3,
-          pointRadius: 7,
-          pointBackgroundColor: '#38bdf8',
-          fill: false,
-          tension: .35,
-          yAxisID: 'y',
-          order: 1,
-          z: 10,
-        },
-        {
-          type: 'line',
-          label: 'CI95 dưới (m)',
-          data: lowers,
-          borderColor: 'rgba(56,189,248,.3)',
-          borderWidth: 1.5,
-          borderDash: [4, 4],
-          pointRadius: 4,
-          fill: false,
-          yAxisID: 'y',
-          order: 3,
-        },
-        {
-          type: 'line',
-          label: 'CI95 trên (m)',
-          data: uppers,
-          borderColor: 'rgba(56,189,248,.3)',
-          borderWidth: 1.5,
-          borderDash: [4, 4],
-          pointRadius: 4,
-          fill: false,
-          yAxisID: 'y',
-          order: 4,
-        },
-        {
-          type: 'line',
-          label: `H(t)=${base.toFixed(2)}m`,
-          data: Array(labels.length).fill(base),
-          borderColor: 'rgba(251,191,36,.6)',
-          borderWidth: 1.5,
-          borderDash: [6, 3],
-          pointRadius: 0,
-          fill: false,
-          yAxisID: 'y',
-          order: 5,
-        },
-      ]
-    },
-    options: {
-      responsive: true,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: {
-          labels: { color: '#94a3b8', font: { size: 11, family: 'Outfit' } }
-        },
-        tooltip: {
-          callbacks: {
-            label: ctx => {
-              const v = ctx.parsed.y;
-              if (v == null) return '';
-              return ` ${ctx.dataset.label}: ${v.toFixed(4)}`;
-            }
-          }
-        }
-      },
-      scales: {
-        x:  { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255,255,255,.05)' } },
-        y:  { ticks: { color: '#94a3b8', callback: v => v.toFixed(2)+'m' },
-               grid:  { color: 'rgba(255,255,255,.05)' },
-               title: { display: true, text: 'Mực nước (m)', color: '#64748b' } },
-        y2: { position: 'right', ticks: { color: '#6366f1', callback: v => v.toFixed(2)+'m' },
-               grid: { drawOnChartArea: false },
-               title: { display: true, text: 'Độ rộng CI95 (m)', color: '#6366f1' } },
-      }
-    }
-  });
-
-  document.getElementById('results').style.display = 'block';
+  try{
+    const resp=await fetch('/forecast-realtime',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(bodyData)
+    });
+    if(!resp.ok){const e=await resp.json();throw new Error(e.detail||`HTTP ${resp.status}`);}
+    renderResults(await resp.json(),true);
+  }catch(e){showError(e.message);}
+  finally{btn.disabled=false;spin.style.display='none';}
 }
-
-// Chạy dự báo ngay khi tải trang
-window.addEventListener('load', runForecast);
+async function runHistory() {
+  const date=document.getElementById('dateInput').value;
+  const btn=document.getElementById('btnHistory');
+  const spin=document.getElementById('spinHistory');
+  btn.disabled=true;spin.style.display='block';hideAll();
+  try{
+    const resp=await fetch(date?`/forecast?date=${date}`:'/forecast');
+    if(!resp.ok){const e=await resp.json();throw new Error(e.detail||`HTTP ${resp.status}`);}
+    renderResults(await resp.json(),false);
+  }catch(e){showError(e.message);}
+  finally{btn.disabled=false;spin.style.display='none';}
+}
+function hideAll(){['results','alertBanner','noteBar','errorMsg'].forEach(id=>document.getElementById(id).style.display='none');}
+function showError(msg){const el=document.getElementById('errorMsg');el.textContent='⚠️ '+msg;el.style.display='block';}
+function renderResults(data,isRealtime){
+  const noteEl=document.getElementById('noteBar');
+  if(isRealtime&&data.note){noteEl.textContent='💡 '+data.note;noteEl.style.display='block';}else{noteEl.style.display='none';}
+  const alertEl=document.getElementById('alertBanner');
+  const cls={'BÌNH THƯỜNG':'alert-ok','CẢNH BÁO':'alert-warn','NGUY HIỂM':'alert-danger'};
+  alertEl.className='alert-banner '+(cls[data.alert_level]||'alert-ok');
+  alertEl.innerHTML=data.alert_message;alertEl.style.display='block';
+  const mode=isRealtime?'⚡ Dự báo tương lai':'📂 Tra cứu lịch sử';
+  let ih=`<span>📅 Ngày: <b>${data.issue_date}</b></span><span>💧 H(t): <b>${data.base_level_m.toFixed(2)} m</b></span><span>🤖 Models: <b>t+${data.models_used.join('d, t+')}d</b></span><span>📌 ${mode}</span>`;
+  if(isRealtime&&data.rain_today_mm!==undefined)ih+=`<span>🌧️ Mưa: <b>${data.rain_today_mm}mm</b></span>`;
+  document.getElementById('infoBar').innerHTML=ih;
+  const kpiRow=document.getElementById('kpiRow');kpiRow.innerHTML='';
+  const base=data.base_level_m;
+  data.forecasts.forEach(f=>{
+    const d=f.horizon_d,wl=f.water_level_m.toFixed(3);
+    const delta=f.delta_m!==undefined?f.delta_m:f.water_level_m-base;
+    const sign=delta>=0?'▲':'▼',dcls=delta>=0?'up':'down';
+    const dateStr=f.forecast_date?`<div class="kpi-date">${f.forecast_date}</div>`:'';
+    kpiRow.innerHTML+=`<div class="kpi"><div class="kpi-label">t+${d} ngày</div>${dateStr}<div class="kpi-value">${wl}</div><div class="kpi-unit">mét</div><div class="kpi-delta ${dcls}">${sign}${Math.abs(delta).toFixed(3)} m</div></div>`;
+  });
+  const labels=data.forecasts.map(f=>f.forecast_date||`t+${f.horizon_d}d`);
+  const vals=data.forecasts.map(f=>f.water_level_m);
+  const lowers=data.forecasts.map(f=>f.ci95_lower);
+  const uppers=data.forecasts.map(f=>f.ci95_upper);
+  const ciW=uppers.map((u,i)=>u-lowers[i]);
+  if(chartInstance)chartInstance.destroy();
+  const ctx=document.getElementById('forecastChart').getContext('2d');
+  chartInstance=new Chart(ctx,{
+    data:{labels,datasets:[
+      {type:'bar',label:'CI95 (độ rộng)',data:ciW,backgroundColor:'rgba(99,102,241,.18)',borderColor:'rgba(99,102,241,.4)',borderWidth:1,yAxisID:'y2',order:2},
+      {type:'line',label:'Mực nước dự báo (m)',data:vals,borderColor:'#38bdf8',backgroundColor:'rgba(56,189,248,.12)',borderWidth:3,pointRadius:7,pointBackgroundColor:'#38bdf8',fill:false,tension:.35,yAxisID:'y',order:1,z:10},
+      {type:'line',label:'CI95 dưới',data:lowers,borderColor:'rgba(56,189,248,.3)',borderWidth:1.5,borderDash:[4,4],pointRadius:4,fill:false,yAxisID:'y',order:3},
+      {type:'line',label:'CI95 trên',data:uppers,borderColor:'rgba(56,189,248,.3)',borderWidth:1.5,borderDash:[4,4],pointRadius:4,fill:false,yAxisID:'y',order:4},
+      {type:'line',label:`H(t)=${base.toFixed(2)}m`,data:Array(labels.length).fill(base),borderColor:'rgba(251,191,36,.6)',borderWidth:1.5,borderDash:[6,3],pointRadius:0,fill:false,yAxisID:'y',order:5},
+    ]},
+    options:{responsive:true,interaction:{mode:'index',intersect:false},
+      plugins:{legend:{labels:{color:'#94a3b8',font:{size:11,family:'Outfit'}}},tooltip:{callbacks:{label:c=>{const v=c.parsed.y;return v==null?'':`${c.dataset.label}: ${v.toFixed(4)}`}}}},
+      scales:{x:{ticks:{color:'#94a3b8'},grid:{color:'rgba(255,255,255,.05)'}},y:{ticks:{color:'#94a3b8',callback:v=>v.toFixed(2)+'m'},grid:{color:'rgba(255,255,255,.05)'},title:{display:true,text:'Mực nước (m)',color:'#64748b'}},y2:{position:'right',ticks:{color:'#6366f1',callback:v=>v.toFixed(2)+'m'},grid:{drawOnChartArea:false},title:{display:true,text:'Độ rộng CI95',color:'#6366f1'}}}}
+  });
+  document.getElementById('results').style.display='block';
+}
 </script>
 </body>
 </html>
 """
     return HTMLResponse(content=html_content, status_code=200)
+
 
 
 # ---------------------------------------------------------------------------
