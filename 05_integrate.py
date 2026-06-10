@@ -643,17 +643,29 @@ def build_daily_features(
         if col in df_nasa_daily.columns:
             df[col] = df_nasa_daily[col].reindex(df.index)
 
-    # Sau khi merge, tính rain_30d từ rain_1d đã ghep (tránh mất dữ liệu 2017-2019)
+    # Tính mưa tích lũy rolling từ rain_1d (tránh mất dữ liệu 2017-2019)
     if "rain_1d" in df.columns:
-        df["rain_30d"] = df["rain_1d"].rolling(30, min_periods=1).sum()  # [MỚI]
+        df["rain_30d"] = df["rain_1d"].rolling(30, min_periods=1).sum()
+        # [MỚI v6] rain_60d — thông tin mưa dài hạn giúp t+7d nhận biết đang đầu/cuối mùa lũ
+        df["rain_60d"] = df["rain_1d"].rolling(60, min_periods=1).sum()
 
     # --- Lag mực nước (chỉ quá khứ — không rò rỉ) ---
     for lag in [1, 3, 7, 14, 30]:
         df[f"water_level_lag{lag}"] = df["water_level_m"].shift(lag)
+    # [MỚI v6] lag60 — trạng thái hồ 2 tháng trước, quan trọng cho dự báo 7 ngày
+    df["water_level_lag60"] = df["water_level_m"].shift(60)
 
     # --- Rolling statistics ---
-    df["water_level_roll7"] = df["water_level_m"].rolling(7, min_periods=3).mean()
-    df["water_level_std7"]  = df["water_level_m"].rolling(7, min_periods=3).std()
+    df["water_level_roll7"]  = df["water_level_m"].rolling(7,  min_periods=3).mean()
+    df["water_level_std7"]   = df["water_level_m"].rolling(7,  min_periods=3).std()
+    # [MỚI v6] Rolling 30/60 ngày — xu hướng dài hạn của hồ (mùa lũ vs mùa khô)
+    df["water_level_roll30"] = df["water_level_m"].rolling(30, min_periods=7).mean()
+    df["water_level_roll60"] = df["water_level_m"].rolling(60, min_periods=14).mean()
+
+    # [MỚI v6] Biến đổi mực nước — xu hướng tăng/giảm trong 7 và 30 ngày vừa qua
+    # Công thức: delta = H(t) - H(t-k), không dùng shift(-k) để tránh data leakage
+    df["delta_h_7d"]  = df["water_level_m"] - df["water_level_m"].shift(7)
+    df["delta_h_30d"] = df["water_level_m"] - df["water_level_m"].shift(30)
 
     # --- Temporal encoding (tuần hoàn) ---
     df["month_sin"]  = np.sin(2 * np.pi * df.index.month / 12)
@@ -662,9 +674,13 @@ def build_daily_features(
     df["season_dry"] = df.index.month.isin([11, 12, 1, 2, 3, 4]).astype(int)
 
     logger.info(
-        "  Features: %d cột x %d ngày | mực nước %.2f-%.2fm",
+        "  Features v6: %d cột x %d ngày | mực nước %.2f-%.2fm",
         len(df.columns), len(df),
         df["water_level_m"].min(), df["water_level_m"].max()
+    )
+    logger.info(
+        "  [MỚI v6] Features bổ sung: rain_60d, water_level_lag60, "
+        "roll30, roll60, delta_h_7d, delta_h_30d"
     )
 
     return df
