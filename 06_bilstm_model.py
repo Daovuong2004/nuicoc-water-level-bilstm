@@ -49,32 +49,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from config import (
-    WINDOW_SIZE,
-    FORECAST_DAYS,
-    BATCH_SIZE,
-    MAX_EPOCHS,
-    PATIENCE,
-    MIN_DELTA_ES,
-    LSTM_UNITS,
-    USE_BIDIRECTIONAL,
-    RECURRENT_DROPOUT,
-    DROPOUT_RATE,
-    L2_REG,
-    LEARNING_RATE,
-    MC_SAMPLES,
-    FEATURE_COLS,
-    TARGET_COL,
-    BASE_LEVEL_COL,
-    PREDICT_DELTA_H,
-    ENSEMBLE_PERSISTENCE_WEIGHT,
-    ES_VAL_FRACTION,
-    SAMPLE_WEIGHT_FLOOD,
-    FLOOD_DELTA_THRESHOLD_M,
-    APPLY_LAG_D_ALIGNMENT,
-    TRAIN_CONFIG_PATH,
-    MNDBT,
-    target_delta_col,
-    target_abs_col,
+    FEATURE_COLS, FORECAST_DAYS, TARGET_COL, BASE_LEVEL_COL,
+    PREDICT_DELTA_H, TARGET_DELTA_PREFIX,
+    WINDOW_SIZE, LSTM_UNITS, USE_BIDIRECTIONAL,
+    RECURRENT_DROPOUT, DROPOUT_RATE, LEARNING_RATE,
+    BATCH_SIZE, MAX_EPOCHS, PATIENCE, MIN_DELTA_ES, L2_REG, MC_SAMPLES,
+    ENSEMBLE_PERSISTENCE_WEIGHT, ES_VAL_FRACTION,
+    SAMPLE_WEIGHT_FLOOD, FLOOD_DELTA_THRESHOLD_M,
+    APPLY_LAG_D_ALIGNMENT, MNDBT, CANH_BAO, NGUY_HIEM,
+    target_delta_col, target_abs_col,
+    # [v6] Config riêng cho t+7d
+    FEATURE_COLS_T7D, WINDOW_SIZE_T7D, LSTM_UNITS_T7D,
+    DROPOUT_RATE_T7D, DENSE_UNITS_T7D, L2_REG_T7D, PATIENCE_T7D,
 )
 
 os.makedirs("models",  exist_ok=True)
@@ -163,9 +149,10 @@ def create_sequences(
 # KIẾN TRÚC MÔ HÌNH LSTM (v5)
 # ============================================================
 def build_bilstm(input_shape: tuple, lstm_units: list,
-                 dropout_rate: float) -> Model:
+                 dropout_rate: float, dense_units: int = 32,
+                 l2_reg: float = None) -> Model:
     """
-    Kiến trúc Bi-LSTM (v5.1).
+    Kiến trúc Bi-LSTM (v5.1 + v6 per-horizon config).
 
     Nếu USE_BIDIRECTIONAL = True (mặc định):
       - Bi-LSTM: xử lý sequence cả hai chiều (forward + backward)
@@ -175,9 +162,10 @@ def build_bilstm(input_shape: tuple, lstm_units: list,
     Nếu USE_BIDIRECTIONAL = False (fallback):
       - LSTM đơn hướng thông thường.
 
-    Đầu vào: (batch, WINDOW_SIZE, n_features)
+    Đầu vào: (batch, window_size, n_features)
     Đầu ra: dự báo ΔH (scalar)
     """
+    reg = l2(l2_reg if l2_reg is not None else L2_REG)
     inputs = Input(shape=input_shape, name="input_sequence")
     if USE_BIDIRECTIONAL:
         x = Bidirectional(
@@ -198,10 +186,10 @@ def build_bilstm(input_shape: tuple, lstm_units: list,
             name="lstm_1",
         )(inputs)
     x = Dropout(dropout_rate, name="dropout_1")(x)
-    # Dense layer: input dim tự động phù hợp với cả Bi-LSTM (128) và LSTM (64)
-    x = Dense(32, activation="relu", kernel_regularizer=l2(L2_REG), name="dense_1")(x)
+    # Dense layer: size có thể điều chỉnh theo horizon
+    x = Dense(dense_units, activation="relu", kernel_regularizer=reg, name="dense_1")(x)
     outputs = Dense(1, activation="linear", name="output")(x)
-    model_name = "BiLSTM_v51" if USE_BIDIRECTIONAL else "LSTM_v51"
+    model_name = "BiLSTM_v6" if USE_BIDIRECTIONAL else "LSTM_v6"
     return Model(inputs=inputs, outputs=outputs, name=model_name)
 
 
@@ -472,10 +460,33 @@ def train_and_evaluate(
     abs_col = target_abs_col(horizon_d)
     model_path = f"models/bilstm_t{horizon_d}d.keras"
 
+    # ── [v6] Per-horizon config: t+7d dùng config mở rộng riêng ───────────────────────────
+    if horizon_d == 7:
+        _window      = WINDOW_SIZE_T7D     # 45 (vs 21)
+        _feat_cols   = FEATURE_COLS_T7D    # 21 features (vs 16)
+        _lstm_units  = LSTM_UNITS_T7D      # [96] (vs [64])
+        _dropout     = DROPOUT_RATE_T7D    # 0.3 (vs 0.5)
+        _dense_units = DENSE_UNITS_T7D     # 64 (vs 32)
+        _l2_reg      = L2_REG_T7D          # 5e-4 (vs 1e-3)
+        _patience    = PATIENCE_T7D        # 25 (vs 20)
+        logger.info(
+            "  [v6] t+7d EXTENDED CONFIG: window=%d, features=%d, "
+            "lstm=%s, dropout=%.1f, dense=%d",
+            _window, len(_feat_cols), _lstm_units, _dropout, _dense_units,
+        )
+    else:
+        _window      = WINDOW_SIZE
+        _feat_cols   = feature_cols
+        _lstm_units  = LSTM_UNITS
+        _dropout     = DROPOUT_RATE
+        _dense_units = 32
+        _l2_reg      = L2_REG
+        _patience    = PATIENCE
+
     logger.info("=" * 58)
     logger.info(
-        "  HUẤN LUYỆN: t+%dd | %d features | LSTM v5 | target=%s",
-        horizon_d, len(feature_cols), target_col,
+        "  HUẤN LUYỆN: t+%dd | %d features | window=%d | LSTM%s | target=%s",
+        horizon_d, len(_feat_cols), _window, _lstm_units, target_col,
     )
     logger.info("=" * 58)
 
@@ -485,9 +496,16 @@ def train_and_evaluate(
                 raise KeyError(
                     f"Thiếu cột '{col}' trong tập '{name}'.\nChạy lại 05_integrate.py."
                 )
+        # Kiểm tra features mới có trong dataset không
+        missing = [f for f in _feat_cols if f not in split.columns]
+        if missing:
+            raise KeyError(
+                f"Tập '{name}' thiếu các features: {missing}\n"
+                "Chạy lại 05_integrate.py để tạo lại dataset với features mới."
+            )
 
     X_train, y_train, ts_train, base_train, sw_train = create_sequences(
-        df_train, feature_cols, target_col, WINDOW_SIZE
+        df_train, _feat_cols, target_col, _window
     )
     # Tăng trọng số sự kiện biến động mạnh (|ΔH| lớn)
     y_delta_raw = df_train.loc[ts_train, target_col].values
@@ -497,12 +515,12 @@ def train_and_evaluate(
         1.0,
     )
     X_test, y_test, ts_test, base_test, sw_test = create_sequences(
-        df_test, feature_cols, target_col, WINDOW_SIZE
+        df_test, _feat_cols, target_col, _window
     )
     X_val, y_val, ts_val, base_val, sw_val = create_sequences(
-        df_val, feature_cols, target_col, WINDOW_SIZE
+        df_val, _feat_cols, target_col, _window
     )
-    y_val_abs = df_val.loc[ts_val, abs_col].values
+    y_val_abs  = df_val.loc[ts_val,  abs_col].values
     y_test_abs = df_test.loc[ts_test, abs_col].values
 
     logger.info("  Train: %s | Test (EarlyStopping): %s | Val (Bao cao): %s",
@@ -535,9 +553,11 @@ def train_and_evaluate(
     logger.info("  [Scaler] Đã lưu target scaler: %s", scaler_path)
 
     model = build_bilstm(
-        input_shape=(WINDOW_SIZE, len(feature_cols)),
-        lstm_units=LSTM_UNITS,
-        dropout_rate=DROPOUT_RATE,
+        input_shape=(_window, len(_feat_cols)),
+        lstm_units=_lstm_units,
+        dropout_rate=_dropout,
+        dense_units=_dense_units,
+        l2_reg=_l2_reg,
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
@@ -551,7 +571,7 @@ def train_and_evaluate(
     # Callbacks
     callbacks = [
         EarlyStopping(
-            monitor="val_loss", patience=PATIENCE, min_delta=MIN_DELTA_ES,
+            monitor="val_loss", patience=_patience, min_delta=MIN_DELTA_ES,
             restore_best_weights=True, verbose=1,
         ),
         ModelCheckpoint(model_path, monitor="val_loss",
@@ -690,15 +710,20 @@ def train_and_evaluate(
 
     if horizon_d == FORECAST_DAYS[0]:
         train_cfg = {
-            "version": "5.0",
+            "version": "6.0",
             "predict_delta_h": PREDICT_DELTA_H,
             "window_size": WINDOW_SIZE,
+            "window_size_t7d": WINDOW_SIZE_T7D,
             "feature_cols": FEATURE_COLS,
+            "feature_cols_t7d": FEATURE_COLS_T7D,
             "ensemble_persistence_weight": ENSEMBLE_PERSISTENCE_WEIGHT,
             "lstm_units": LSTM_UNITS,
+            "lstm_units_t7d": LSTM_UNITS_T7D,
             "dropout_rate": DROPOUT_RATE,
+            "dropout_rate_t7d": DROPOUT_RATE_T7D,
         }
-        with open(TRAIN_CONFIG_PATH, "w", encoding="utf-8") as f:
+        _config_path = os.path.join("models", "train_config.json")
+        with open(_config_path, "w", encoding="utf-8") as f:
             json.dump(train_cfg, f, ensure_ascii=False, indent=2)
 
     return metrics_val, metrics_test, model
