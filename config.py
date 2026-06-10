@@ -1,6 +1,12 @@
 """
-config.py — Cấu hình trung tâm (v5.1 — Bi-LSTM + chống overfitting)
+config.py — Cấu hình trung tâm (v6 — Bi-LSTM + t+7d Extended Features)
 ====================================================================
+Thay đổi v6 (cải thiện t+7d):
+  - FEATURE_COLS_T7D: bộ 21 features riêng cho t+7d với lag/rolling dài hơn
+    Thêm: rain_60d, water_level_lag60, roll30, roll60, delta_h_7d, delta_h_30d
+  - WINDOW_SIZE_T7D = 45 ngày (vs 21 cho t+1/3d)
+  - LSTM_UNITS_T7D = [96] (vs [64]), Dense(64) (vs Dense(32))
+  - DROPOUT_RATE_T7D = 0.3 (giảm regularization cho pattern dài hạn)
 Thay đổi v5.1:
   - Bật USE_BIDIRECTIONAL = True → kiến trúc Bi-LSTM thật sự
   - LSTM_UNITS tăng lên [64]: mỗi chiều (fwd/bwd) 64 units, output 128
@@ -52,7 +58,7 @@ PREDICT_DELTA_H = True          # Học ΔH = H(t+d) - H(t)
 TARGET_DELTA_PREFIX = "target_delta_t"
 
 # ============================================================
-# FEATURES (18 — không gồm water_level_m, Q_out, delta_h trùng lag)
+# FEATURES (16 — không gồm water_level_m, lag1/3 — chống học vẹt)
 # ============================================================
 # Không dùng lag1/lag3 — gây học vẹt H(t) ≈ H(t+d) → đỉnh lệch d ngày trên valid_time
 FEATURE_COLS = [
@@ -65,11 +71,38 @@ FEATURE_COLS = [
 
 FEATURE_COUNT = len(FEATURE_COLS)
 
+# ============================================================
+# FEATURES MỞ RỘNG CHO t+7d (21 features — thêm lag/rolling dài hạn)
+# ============================================================
+# Lý do: t+7d cần nắm xu hướng 60-90 ngày (quán tính thủy văn dài)
+# Các features thêm KHÔNG có trong FEATURE_COLS (tránh trùng lặp):
+#   rain_60d      : mưa tích lũy 60 ngày — nhận biết đầu/cuối mùa mưa
+#   lag60         : mực nước 2 tháng trước — so sánh xu hướng dài hạn
+#   roll30/60     : rolling mean 30/60 ngày — xu hướng hồ ổn định
+#   delta_h_7d    : H(t)-H(t-7) — momentum tăng/giảm 7 ngày gần nhất
+#   delta_h_30d   : H(t)-H(t-30) — momentum tăng/giảm 1 tháng gần nhất
+FEATURE_COLS_T7D = [
+    # --- Giữ nguyên 16 features gốc ---
+    "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
+    "temperature", "humidity",
+    "water_level_lag7", "water_level_lag14", "water_level_lag30",
+    "water_level_roll7", "water_level_std7",
+    "month_sin", "month_cos", "season_wet", "season_dry",
+    # --- Thêm 5 features dài hạn ---
+    "rain_60d",
+    "water_level_lag60",
+    "water_level_roll30",
+    "delta_h_7d",
+    "delta_h_30d",
+]
+
+FEATURE_COUNT_T7D = len(FEATURE_COLS_T7D)
+
 # Cột giữ nguyên đơn vị mét (không scale)
 META_COLS = [BASE_LEVEL_COL, "sample_weight", "is_observed"]
 
 # ============================================================
-# CỬA SỔ & MÔ HÌNH Bi-LSTM (v5.1)
+# CỬA SỔ & MÔ HÌNH Bi-LSTM (v5.1 — dùng cho t+1d, t+3d)
 # ============================================================
 WINDOW_SIZE = 21
 LSTM_UNITS = [64]              # Mỗi chiều (fwd/bwd) 64 units → output 128 chiều
@@ -83,6 +116,20 @@ PATIENCE = 20                  # Tăng từ 5→20: tránh dừng sớm khi loss
 MIN_DELTA_ES = 0.001           # Giảm từ 0.005→0.001: nhạy với cải thiện nhỏ
 L2_REG = 1e-3
 MC_SAMPLES = 50
+
+# ============================================================
+# CONFIG RIÊNG CHO t+7d (v6 — Extended features + larger model)
+# ============================================================
+# Lý do tách config riêng: t+7d cần kiến trúc khác t+1d/t+3d
+#   - Cửa sổ dài hơn để nắm quán tính thủy văn 45 ngày
+#   - LSTM rộng hơn để học pattern phức tạp hơn
+#   - Dropout thấp hơn: pattern dài hạn ít nhiễu hơn ngắn hạn
+WINDOW_SIZE_T7D    = 45        # 45 ngày (vs 21) — nắm xu hướng 6 tuần
+LSTM_UNITS_T7D     = [96]      # 96 units/chiều → output 192 chiều (vs 128)
+DROPOUT_RATE_T7D   = 0.3      # Ít regularize hơn (vs 0.5) — pattern dài hạn ổn định
+DENSE_UNITS_T7D    = 64       # Dense 64 (vs 32) — học interaction phức tạp hơn
+L2_REG_T7D         = 5e-4     # Ít regularize hơn (vs 1e-3)
+PATIENCE_T7D       = 25       # Kiên nhẫn hơn với val loss dao động chậm
 
 # Không trộn persistence — tránh sao chép H(t) làm đỉnh lệch trên biểu đồ
 ENSEMBLE_PERSISTENCE_WEIGHT = 0.0
