@@ -32,14 +32,14 @@ Bao chi/Cua xa   ─┘   (Kalman + Q_out)   (Bi-LSTM)              + Khoang tin
 
 | Thanh phan | Ky thuat |
 |-----------|---------|
-| **Mo hinh** | Bi-LSTM 2 lop (256, 128) + Dense (L2 regularizer) |
+| **Mo hinh** | Bidirectional LSTM (64 units/chieu → 128 output) + Dense(32) + L2(1e-3) |
 | **Uncertainty** | Monte Carlo Dropout (50 samples) → khoang tin cay 95% cho tung du bao |
-| **XAI** | SHAP Feature Importance — gia thich "mo hinh dua vao gi" |
+| **XAI** | SHAP Feature Importance (GradientExplainer) — giai thich "mo hinh dua vao gi" |
 | **Du lieu ve tinh** | Sentinel-2 SR + QA60 cloud mask → NDWI → duong cong A-H |
 | **Thuy van** | Phuong trinh can bang nuoc: Q_out = -A(H) × dH/dt / 86400 |
 | **Noi suy** | PCHIP interpolation (bao toan don dieu cuc bo) cho gap ≤ 60 ngay |
-| **Anti-leakage** | MinMaxScaler chi fit tren tap train |
-| **Danh gia** | Nash-Sutcliffe Efficiency (NSE) — chi so chuan thuy van |
+| **Anti-leakage** | StandardScaler chi fit tren tap train; EarlyStopping dung 15% cuoi train |
+| **Danh gia** | NSE (Nash-Sutcliffe) + RMSE + MAE + PBIAS + F1-Score nguong van hanh |
 | **Serving** | FastAPI + MC Dropout inference + canh bao lu tu dong |
 
 ---
@@ -139,60 +139,105 @@ Sau khi khoi dong, truy cap:
 
 ---
 
-## Bo dac trung dau vao (26 features)
+## Bo dac trung dau vao
+
+### Bo features chuan (16 features — dung cho t+1d, t+3d, t+14d, t+30d)
 
 | Nhom | Features | Mo ta |
 |------|---------|-------|
 | **Khi tuong** | `rain_1d`, `rain_3d`, `rain_7d`, `rain_14d`, `rain_30d` | Luong mua tich luy (mm) |
 | **Khi tuong** | `temperature`, `humidity` | Nhiet do (°C), Do am (%) |
-| **Lag muc nuoc** | `water_level_lag1/3/7/14/30/60` | Muc nuoc tre 1/3/7/14/30/60 ngay (m) |
-| **Rolling stats** | `water_level_roll7/30/60` | Trung binh truot 7/30/60 ngay (m) |
-| **Rolling stats** | `water_level_std7` | Do lech chuan muc nuoc 7 ngay (m) |
-| **Temporal** | `month_sin`, `month_cos` | Ma hoa tuan hoan thang |
-| **Temporal** | `season_wet`, `season_dry` | Mua mua/kho (0/1) |
-| **Xu huong** | `delta_h_7d`, `delta_h_30d` | Bien doi muc nuoc 7/30 ngay truoc (m) |
-| **Q_out** | `dH_dt_daily` | Toc do thay doi muc nuoc (m/ngay) |
-| **Q_out** | `Q_out_daily`, `Q_out_roll7` | Luu luong xa uoc tinh (m³/s) |
+| **Lag muc nuoc** | `water_level_lag7`, `water_level_lag14`, `water_level_lag30` | Muc nuoc tre 7/14/30 ngay (m) |
+| **Rolling stats** | `water_level_roll7`, `water_level_std7` | TB truot 7 ngay & Do lech chuan (m) |
+| **Temporal** | `month_sin`, `month_cos` | Ma hoa tuan hoan thang (cyclical encoding) |
+| **Temporal** | `season_wet`, `season_dry` | Mua mua (thang 5-10) / kho (thang 11-4) |
 
-**Cua so thoi gian**: 60 ngay | **Chan troi du bao**: 1, 3, 7, 14, 30 ngay
+### Bo features mo rong (21 features — dung rieng cho t+7d)
+
+Giu nguyen 16 features tren, bo sung them:
+
+| Feature | Mo ta |
+|---------|-------|
+| `rain_60d` | Mua tich luy 60 ngay — nhan biet dau/cuoi mua lu |
+| `water_level_lag60` | Muc nuoc 60 ngay truoc — so sanh xu huong dai han |
+| `water_level_roll30` | Trung binh truot 30 ngay — xu huong ho on dinh |
+| `delta_h_7d` | H(t) - H(t-7) — momentum tang/giam 7 ngay gan nhat |
+| `delta_h_30d` | H(t) - H(t-30) — momentum tang/giam 1 thang gan nhat |
+
+**Cua so thoi gian**: 21 ngay (t+1/3/14/30d) | 45 ngay (t+7d) | **Chan troi du bao**: 1, 3, 7, 14, 30 ngay
 
 ---
 
 ## Phan chia du lieu
 
-| Tap | Giai doan | So ngay | Muc dich |
-|-----|-----------|---------|---------|
-| **Train** | 2017-01 → 2022-12 | ~2190 | Huan luyen (co data tong hop 2017-2019) |
-| **Validation** | 2023-01 → 2023-12 | ~365 | Tuning sieu tham so |
-| **Test** | 2024-01 → 2025-12 | ~730 | Danh gia — bao gom lu Yagi thang 9/2024 |
+| Ten tap (file) | Ten trong bao cao | Giai doan | So ngay | Muc dich |
+|---------------|------------------|-----------|---------|----------|
+| `dataset_train.csv` | **Train** | 2019-04 → 2022-12 | ~1340 | Huan luyen toan bo tham so Bi-LSTM |
+| `dataset_test.csv` | **EarlyStopping-Val** | 2023-01 → 2023-12 | ~365 | Dieu chinh EarlyStopping & ReduceLROnPlateau |
+| `dataset_val.csv` | **Evaluation Set** | 2024-01 → 2025-12 | ~730 | **Ket qua chinh thuc trong luan van** (bao gom lu Yagi 9/2024) |
 
-> **Ghi chu**: Du lieu 2017-2019 duoc tong hop tu seasonal pattern cua GEE thuc (Gaussian smoothing, sigma=7 ngay) vi GEE Sentinel-2 chi co ~80 diem quan trac thuc giai doan 2019-2025.
+> **Luu y quan trong ve dat ten**: File `dataset_test.csv` (nam 2023) duoc dung cho EarlyStopping noi bo — **khong phai ket qua bao cao**. File `dataset_val.csv` (nam 2024+) la tap **kiem dinh doc lap cuoi cung** duoc bao cao trong luan van.
+>
+> **Du lieu tong hop**: Giai doan 2017-2019 duoc bo sung bang du lieu thuy van tong hop tu seasonal pattern cua GEE thuc (Gaussian smoothing, sigma=7 ngay), vi GEE Sentinel-2 chi co ~80 diem quan trac thuc giai doan 2019-2025. Trong so mau: quan trac thuc=1.0, noi suy/tong hop=0.25.
 
 ---
 
 ## Kien truc mo hinh Bi-LSTM
 
+### Kien truc chuan (t+1d, t+3d, t+14d, t+30d)
+
 ```
-Input (60, 26)
+Input (window=21 ngay, 16 features)
     │
     ▼
-BiLSTM(256, return_sequences=True) ── Dropout(0.25)
+Bidirectional(LSTM(64 units, recurrent_dropout=0.2))
+  ├─ Forward LSTM(64)  →┐
+  └─ Backward LSTM(64) →┘ Concat → output 128 chieu
     │
     ▼
-BiLSTM(128, return_sequences=False) ── Dropout(0.25)
+Dropout(0.5)
     │
     ▼
-Dense(64, relu) ── L2(1e-4)
+Dense(32, activation='relu') + L2(1e-3)
     │
     ▼
-Dense(32, relu) → Dense(1, linear)
+Dense(1, activation='linear')   ← Du bao ΔH (scaled)
     │
     ▼
-Output: Muc nuoc du bao (m)
+Hau xu ly: ΔH → H(t+d) = H(t) + ΔH (inverse_transform)
+```
+
+### Kien truc mo rong rieng cho t+7d
+
+```
+Input (window=45 ngay, 21 features)
+    │
+    ▼
+Bidirectional(LSTM(96 units, recurrent_dropout=0.2))
+  ├─ Forward LSTM(96)  →┐
+  └─ Backward LSTM(96) →┘ Concat → output 192 chieu
+    │
+    ▼
+Dropout(0.3)   ← Giam regularization vi pattern dai han on dinh hon
+    │
+    ▼
+Dense(64, activation='relu') + L2(5e-4)
+    │
+    ▼
+Dense(1, activation='linear')   ← Du bao ΔH (scaled)
 ```
 
 **Ly do dung Bi-LSTM trong thuy van:**
-Bi-LSTM xu ly chuoi thoi gian theo ca hai chieu (xuoi va nguoc). Chieu xuoi giup hoc xu huong tich luy mua va tang muc nuoc. Chieu nguoc giup nam bat cac quy luat chu ky mua kho va dien bien ha luu cua ho chua.
+Bi-LSTM xu ly chuoi thoi gian theo ca hai chieu (xuoi va nguoc). Chieu xuoi giup hoc xu huong tich luy mua va tang muc nuoc. Chieu nguoc giup nam bat cac quy luat chu ky mua kho. Ket qua ablation study: Bi-LSTM (RMSE=0.374m, NSE=0.988) vuot troi LSTM don huong (RMSE=0.482m, NSE=0.981) va GRU (RMSE=0.480m, NSE=0.981) tai t+1d.
+
+**Tham so huan luyen:**
+| Tham so | Gia tri |
+|---------|--------|
+| Loss function | Huber(delta=1.0) — it nhay voi outlier dinh lu |
+| Optimizer | Adam(lr=0.001) |
+| Batch size | 32 |
+| Max epochs | 150 (EarlyStopping patience=20) |
+| Target scaling | StandardScaler (ho tro ngoai suy dinh lu) |
 
 ---
 
@@ -228,13 +273,25 @@ curl -X POST "http://localhost:8000/predict" \
 
 ## Chi so danh gia
 
-Danh gia theo tieu chuan thuy van quoc te (NSE ≥ 0.75 = Tot):
+Danh gia theo tieu chuan thuy van quoc te (Moriasi et al., 2007 & WMO):
 
-| Chi so | Y nghia |
-|--------|---------|
-| **NSE** (Nash-Sutcliffe) | 1.0: hoan hao | 0.0: ngang trung binh | <0: kem |
-| **RMSE** | Sai so can bac hai trung binh (m) |
-| **MAE** | Sai so tuyet doi trung binh (m) |
+| Chi so | Cong thuc | Nguong Tot |
+|--------|-----------|------------|
+| **NSE** (Nash-Sutcliffe Efficiency) | `1 - Σ(obs-sim)²/Σ(obs-mean)²` | NSE ≥ 0.75 |
+| **RMSE** (Root Mean Squared Error) | `√(mean((obs-sim)²))` | cang nho cang tot (m) |
+| **MAE** (Mean Absolute Error) | `mean(|obs-sim|)` | cang nho cang tot (m) |
+| **PBIAS** (Percent Bias) | `100×Σ(sim-obs)/Σ(obs)` | \|PBIAS\| < 10% = Tot |
+| **F1-Score** (phan loai vuot nguong) | Precision-Recall tren nhi phan | cang cao cang tot |
+
+### Ket qua tren tap Evaluation (2024-2025, bao gom lu Yagi 9/2024)
+
+| Horizon | RMSE (m) | MAE (m) | NSE | PBIAS (%) | Danh gia |
+|---------|---------|--------|-----|----------|----------|
+| **t+1d** | 0.358 | 0.219 | **0.989** | 0.032 | ✅ Xuat sac |
+| **t+3d** | 0.965 | 0.570 | **0.922** | 0.093 | ✅ Tot |
+| **t+7d** | 2.061 | 1.205 | 0.643 | 0.443 | 🟡 Kha |
+| t+14d | 3.147 | 2.388 | 0.163 | 0.308 | 🔴 Yeu |
+| t+30d | 4.556 | 3.893 | -0.702 | 3.618 | 🔴 Rat yeu |
 
 ---
 

@@ -1,7 +1,8 @@
 {
-  "version": "5.0",
+  "version": "7.0",
   "predict_delta_h": true,
   "window_size": 21,
+  "window_size_t7d": 45,
   "feature_cols": [
     "rain_1d",
     "rain_3d",
@@ -18,11 +19,56 @@
     "month_sin",
     "month_cos",
     "season_wet",
-    "season_dry"
+    "season_dry",
+    "rain_1d_lag1",
+    "rain_1d_lag2",
+    "rain_1d_lag3",
+    "rain_1d_lag5"
   ],
+  "feature_cols_t7d": [
+    "rain_1d",
+    "rain_3d",
+    "rain_7d",
+    "rain_14d",
+    "rain_30d",
+    "temperature",
+    "humidity",
+    "water_level_lag7",
+    "water_level_lag14",
+    "water_level_lag30",
+    "water_level_roll7",
+    "water_level_std7",
+    "month_sin",
+    "month_cos",
+    "season_wet",
+    "season_dry",
+    "rain_60d",
+    "water_level_lag60",
+    "water_level_roll30",
+    "delta_h_7d",
+    "delta_h_30d",
+    "rain_1d_lag1",
+    "rain_1d_lag2",
+    "rain_1d_lag3",
+    "rain_1d_lag5"
+  ],
+  "feature_count": 20,
+  "feature_count_t7d": 25,
   "ensemble_persistence_weight": 0.0,
   "lstm_units": [
     64
   ],
-  "dropout_rate": 0.5
+  "lstm_units_t7d": [
+    96
+  ],
+  "dropout_rate": 0.5,
+  "dropout_rate_t7d": 0.3,
+  "lambda_phase": 0.1,
+  "lambda_nse": 0.05,
+  "rain_lag_extra": [
+    1,
+    2,
+    3,
+    5
+  ]
 }

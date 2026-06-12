@@ -9,7 +9,7 @@ LÝ DO CHUYỂN SANG DAILY:
   đáng tin cậy để train BiLSTM. Giải pháp: dùng tần số NGÀY + augmentation
   thủy văn để đạt >= 300 điểm training.
 
-LUỒNG XỬ LÝ:
+LUỒNG Xử LÝ:
   (a) Làm sạch GEE Sentinel-2 (loại fallback 36m, outlier >3500ha, dedup)
   (b) Augmentation dữ liệu thủy văn tổng hợp (2017-2019 + lấp gap)
   (c) NASA POWER aggregate ngày (sum rain, mean temp/humidity)
@@ -17,13 +17,15 @@ LUỒNG XỬ LÝ:
   (e) Feature engineering ngày (lag 1/3/7/14/30, rolling 7/30, seasonal)
   (f) Q_out daily estimation từ phương trình cân bằng nước
   (g) Chia train/val/test theo thời gian (không shuffle)
-  (h) Min-Max normalization (fit chỉ trên train)
+  (h) StandardScaler normalization (fit chỉ trên train)
   (i) Lưu 4 file CSV cho bước huấn luyện BiLSTM
 
-Phân chia thời gian:
-  Train : 2017-01 -> 2022-12  (bao gồm augmented data)
-  Val   : 2023-01 -> 2023-12
-  Test  : 2024-01 -> 2025-12  (bao gồm lũ Yagi 9/2024)
+Phân chia thời gian và QUY ƯỚC ĐẶT TÊN (rất quan trọng!):
+  dataset_train.csv  = Tập TRAIN  : 2019-04 → 2022-12  — huấn luyện tham số
+  dataset_test.csv   = Tập ES-VAL : 2023-01 → 2023-12  — nội bộ EarlyStopping
+                       (TRONG code gọi là 'test', KHÔNG phải kết quả báo cáo!)
+  dataset_val.csv    = Tập EVAL   : 2024-01 → nay      — kiểm định độc lập
+                       (ĐÂY là kết quả chính thức trong luận văn, bao gồm lũ Yagi 9/2024)
 """
 
 import os
@@ -70,12 +72,18 @@ from config import (
     PREDICT_DELTA_H,
     target_delta_col,
     target_abs_col,
+    RAIN_LAG_EXTRA,          # [v7] lag mưa từ phân tích TLCC
 )
 
 
 # ============================================================
 # CẤU HÌNH
 # ============================================================
+# Đường dẫn file đầu ra
+# CHU Ý QUY ƯỚC ĐẶT TÊN: (xem giải thích ở docstring trên)
+#   OUTPUT_TRAIN → Tập huấn luyện (Train)
+#   OUTPUT_TEST  → Tập ES nội bộ (năm 2023, gọi là 'test' trong code)
+#   OUTPUT_VAL   → Tập kiểm định độc lập (2024+, kết quả chính thức luận văn)
 OUTPUT_TRAIN = "data/final/dataset_train.csv"   # huan luyen
 OUTPUT_VAL   = "data/final/dataset_val.csv"     # kiem dinh doc lap (2024+)
 OUTPUT_TEST  = "data/final/dataset_test.csv"    # EarlyStopping (2023)
@@ -648,6 +656,19 @@ def build_daily_features(
         df["rain_30d"] = df["rain_1d"].rolling(30, min_periods=1).sum()
         # [MỚI v6] rain_60d — thông tin mưa dài hạn giúp t+7d nhận biết đang đầu/cuối mùa lũ
         df["rain_60d"] = df["rain_1d"].rolling(60, min_periods=1).sum()
+
+        # --- [v7] Lag mưa theo TLCC — tín hiệu dẫn đường chống trễ pha ---
+        # Phân tích TLCC cho hồ Núi Cốc cho thấy mưa tại (t-k) có tương quan
+        # mạnh nhất với ΔH(t) tại k=2-3 ngày (thời gian tập trung nước về hồ).
+        # Việc đưa các lag này vào feature giúp mô hình dự đoán trước khi mực nước
+        # bắt đầu dâng, từ đó giảm hiện tượng trễ pha đỉnh lũ trên biểu đồ.
+        for k in RAIN_LAG_EXTRA:
+            df[f"rain_1d_lag{k}"] = df["rain_1d"].shift(k)
+        logger.info(
+            "  [v7] Đã tạo %d lag mưa TLCC: %s",
+            len(RAIN_LAG_EXTRA),
+            [f'rain_1d_lag{k}' for k in RAIN_LAG_EXTRA]
+        )
 
     # --- Lag mực nước (chỉ quá khứ — không rò rỉ) ---
     for lag in [1, 3, 7, 14, 30]:
