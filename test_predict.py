@@ -125,7 +125,7 @@ def print_result(result: dict, base_level_m: float, end_date_str: str):
 
     print()
     print("=" * 62)
-    print(f"{BOLD}  DỰ BÁO MỰC NƯỚC HỒ NÚI CỐC — Bi-LSTM v5.1{RESET}")
+    print(f"{BOLD}  DỰ BÁO MỰC NƯỚC HỒ NÚI CỐC — Bi-LSTM v7{RESET}")
     print("=" * 62)
     print(f"  Ngày phát hành (issue time) : {end_date_str}")
     print(f"  Mực nước hiện tại H(t)      : {base_level_m:.2f} m")

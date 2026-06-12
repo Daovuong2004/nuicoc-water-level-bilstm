@@ -89,7 +89,7 @@ logger = logging.getLogger("api_serve")
 # ---------------------------------------------------------------------------
 def build_bilstm(input_shape: tuple, mc_dropout: bool = False) -> Model:
     """
-    Kiến trúc Bi-LSTM v5.1 — đồng bộ với 06_bilstm_model.py.
+    Kiến trúc Bi-LSTM v7 — đồng bộ với 06_bilstm_model.py.
 
     Bidirectional(LSTM(...), merge_mode='concat') → output dim = 2 * LSTM_UNITS[0]
     Khi mc_dropout=True: Dropout layer bật training=True để dùng cho MC inference.
@@ -120,7 +120,7 @@ def build_bilstm(input_shape: tuple, mc_dropout: bool = False) -> Model:
         x = Dropout(DROPOUT_RATE, name="dropout_1")(x)
     x = Dense(32, activation="relu", kernel_regularizer=l2(L2_REG), name="dense_1")(x)
     outputs = Dense(1, activation="linear", name="output")(x)
-    model_name = "BiLSTM_v51" if USE_BIDIRECTIONAL else "LSTM_v51"
+    model_name = "BiLSTM_v7" if USE_BIDIRECTIONAL else "LSTM_v7"
     return Model(inputs=inputs, outputs=outputs, name=model_name)
 
 
@@ -386,7 +386,7 @@ async def lifespan(app_instance):  # noqa: ARG001
     Context manager lifespan — thay thế @app.on_event('startup') đã deprecated.
     Khởi động: tải toàn bộ model Bi-LSTM, feature scaler và target scalers.
     """
-    logger.info("=== Khởi động hệ thống dự báo mực nước hồ Núi Cốc v5.1 ===")
+    logger.info("=== Khởi động hệ thống dự báo mực nước hồ Núi Cốc v7 ===")
     models, scaler, target_scalers = load_models_and_scaler()
     app_state["models"] = models
     app_state["scaler"] = scaler
@@ -406,7 +406,7 @@ app = FastAPI(
         "Bi-LSTM với ước lượng bất định Monte Carlo Dropout. "
         "Hỗ trợ dự báo các chân trời 1d, 3d, 7d, 14d, 30d (tần suất Ngày)."
     ),
-    version="5.1",
+    version="7.0",
     contact={
         "name": "Đồ án tốt nghiệp",
         "url": "https://github.com/",

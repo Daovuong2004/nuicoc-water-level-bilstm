@@ -92,6 +92,8 @@ from config import (
     MAX_EPOCHS, PATIENCE, LSTM_UNITS, DROPOUT_RATE, L2_REG,
     LEARNING_RATE, PREDICT_DELTA_H, BASE_LEVEL_COL,
     target_delta_col, target_abs_col,
+    # v6 config riêng cho t+7d:
+    WINDOW_SIZE_T7D, FEATURE_COLS_T7D,
 )
 
 PATIENCE_ES = PATIENCE
@@ -982,18 +984,59 @@ def main() -> None:
 
         if not os.path.exists(bilstm_model_path):
             logger.warning(
-                "  CẢNH BÁO: Chưa tìm thấy '%s'.\n"
-                "  → Hãy chạy '06_bilstm_model.py' trước để huấn luyện.\n"
-                "  → Bỏ qua Bi-LSTM cho t+%dd.",
+                "  CANH BAO: Chua tim thay '%s'.\n"
+                "  -> Hay chay '06_bilstm_model.py' truoc de huan luyen.\n"
+                "  -> Bo qua Bi-LSTM cho t+%dd.",
                 bilstm_model_path, h,
             )
             all_results[h]["Bi-LSTM"] = None
         else:
             try:
-                bilstm_model  = load_model(bilstm_model_path)
-                y_pred_bilstm_scaled = bilstm_model.predict(X_val, verbose=0).flatten()
-                
-                # Nạp target scaler tương ứng từ bước 06 để nghịch đảo chuẩn hóa
+                bilstm_model = load_model(
+                    bilstm_model_path,
+                    compile=False,  # [v7-fix] bỏ qua custom loss '_loss' khi load để chỉ dự báo
+                )
+
+                # t+7d dùng kiến trúc v6 khác: window=45, 21 features
+                # → Phải tạo sequences riêng với config tương ứng
+                if h == 7:
+                    logger.info(
+                        "  [Bi-LSTM t+7d] Dung config v6: window=%d, n_features=%d",
+                        WINDOW_SIZE_T7D, len(FEATURE_COLS_T7D),
+                    )
+                    # Kiểm tra FEATURE_COLS_T7D có đủ trong df_val không
+                    missing_t7 = [c for c in FEATURE_COLS_T7D if c not in df_val.columns]
+                    if missing_t7:
+                        raise KeyError(
+                            f"Thieu {len(missing_t7)} col cho t+7d v6: {missing_t7}\n"
+                            "Hay chay lai 05_integrate.py de tao du features."
+                        )
+                    X_val_bi, y_val_bi, ts_val_bi = create_sequences(
+                        df_val, FEATURE_COLS_T7D, target_col, WINDOW_SIZE_T7D
+                    )
+                    y_val_abs_bi = df_val.loc[ts_val_bi, abs_col].values
+                    base_val_bi  = df_val.loc[ts_val_bi, BASE_LEVEL_COL].values
+                else:
+                    # Các horizon khác dùng cùng sequences đã tạo ở trên
+                    X_val_bi     = X_val
+                    y_val_abs_bi = y_val_abs
+                    base_val_bi  = base_val
+
+                # Kiểm tra shape khớp với model
+                expected_shape = bilstm_model.input_shape[1:]  # (window, n_feat)
+                actual_shape   = X_val_bi.shape[1:]
+                if expected_shape != actual_shape:
+                    raise ValueError(
+                        f"Shape mismatch: model yeu cau {expected_shape}, "
+                        f"nhung X_val_bi co {actual_shape}. "
+                        f"Kiem tra FEATURE_COLS_T7D va WINDOW_SIZE_T7D."
+                    )
+
+                y_pred_bilstm_scaled = bilstm_model.predict(
+                    X_val_bi, verbose=0
+                ).flatten()
+
+                # Nghịch đảo chuẩn hóa: ưu tiên dùng target scaler từ bước 06
                 import joblib
                 horizon_scaler_path = f"models/target_scaler_t{h}d.pkl"
                 if os.path.exists(horizon_scaler_path):
@@ -1001,18 +1044,28 @@ def main() -> None:
                     d_bi = h_scaler.inverse_transform(
                         y_pred_bilstm_scaled.reshape(-1, 1)
                     ).flatten()
+                    logger.info(
+                        "  [Bi-LSTM t+%dd] Dung target_scaler tu models/target_scaler_t%dd.pkl",
+                        h, h,
+                    )
                 else:
+                    # Fallback: dùng target_scaler của baseline (cùng y_train)
                     d_bi = target_scaler.inverse_transform(
                         y_pred_bilstm_scaled.reshape(-1, 1)
                     ).flatten()
-                y_pred_bilstm = base_val + d_bi if PREDICT_DELTA_H else d_bi
-                y_pred_bilstm = w * base_val + (1 - w) * y_pred_bilstm
+                    logger.warning(
+                        "  [Bi-LSTM t+%dd] Khong tim thay horizon_scaler_t%dd.pkl, "
+                        "dung target_scaler fallback.", h, h,
+                    )
+
+                y_pred_bilstm = base_val_bi + d_bi if PREDICT_DELTA_H else d_bi
+                y_pred_bilstm = w * base_val_bi + (1 - w) * y_pred_bilstm
                 all_results[h]["Bi-LSTM"] = evaluate_metrics(
-                    y_val_abs, y_pred_bilstm, label=f"LSTM-de-xuat t+{h}d"
+                    y_val_abs_bi, y_pred_bilstm, label=f"Bi-LSTM t+{h}d"
                 )
             except Exception as exc:
                 logger.error(
-                    "  Lỗi khi load/predict '%s': %s — Bỏ qua.",
+                    "  Loi khi load/predict '%s': %s — Bo qua.",
                     bilstm_model_path, exc,
                 )
                 all_results[h]["Bi-LSTM"] = None

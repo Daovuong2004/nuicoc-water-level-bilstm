@@ -1,17 +1,35 @@
 """
-Bước 6: Huấn luyện và đánh giá mô hình Bi-LSTM (v5.1 — chống overfitting)
+Bước 6: Huấn luyện và đánh giá mô hình Bi-LSTM (v7 — Phase-Aware Loss + TLCC Rain Lags)
 ==========================================================================
-  - Bi-LSTM 2 chiều, 64 units/chiều (→ output 128), window 21 ngày
-  - Dự báo ΔH = H(t+d) - H(t), ghép lại H(t) khi inference
-  - 16 features (không có water_level_m — tránh học vẹt)
-  - sample_weight: quan trắc thật=1.0, nội suy/synthetic=0.25
-  - Ensemble với persistence (cấu hình ENSEMBLE_PERSISTENCE_WEIGHT)
-Split: Train(2019-2022) | Test(2023, EarlyStopping) | Val(2024+, báo cáo)
+Kiến trúc thực tế (khớp với code bên dưới):
+  - Bidirectional(LSTM(64, recurrent_dropout=0.2)) → output 128 chiều
+  - Dropout(0.5)
+  - Dense(32, relu) + L2(1e-3)
+  - Dense(1, linear) → Dự báo ΔH (scaled)
+  Cửa sổ: 21 ngày | 20 features (+4 lag mưa TLCC, không có water_level_m)
+  Riêng t+7d: window=45, LSTM(96), Dropout(0.3), Dense(64), 25 features
+
+[v7] Thay đổi chống trễ pha:
+  Loss = Huber(delta=1.0)
+       + λ_phase * mean(|Δy_true − Δy_pred|)   ← phạt sai lệch độ dốc (độ pha)
+       − λ_nse   * NSE(y_true, y_pred)           ← thưởng hiệu quả thủy văn
+  Feature: thêm rain_1d_lag1/2/3/5 từ phân tích TLCC
+
+Quy ước tập dữ liệu (rất quan trọng, tránh nhầm lẫn):
+  df_train = dataset_train.csv  (2019-04 → 2022-12) : Huấn luyện tham số
+  df_test  = dataset_test.csv   (2023-01 → 2023-12) : Theo dõi EarlyStopping
+  df_val   = dataset_val.csv    (2024-01 → nay)     : Kết quả chính thức luận văn
+
+Chi tiết EarlyStopping:
+  ES thực chất dùng 15% cuối của X_train (ES_VAL_FRACTION=0.15) làm validation.
+  Target scaler = StandardScaler() (không phải MinMaxScaler) — hỗ trợ ngoại suy đỉnh lũ.
+  Ensemble persistence weight = 0.0 (tắt) — tránh đỉnh bị lệch d ngày.
 """
 
 import os
 import json
 import logging
+import traceback
 from datetime import datetime
 
 import numpy as np
@@ -32,6 +50,14 @@ from tensorflow.keras.callbacks import (
     EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, CSVLogger,
 )
 from sklearn.metrics import mean_squared_error, mean_absolute_error, f1_score
+
+# ============================================================
+# TÁI LẬP KẺT QUẢ (Reproducibility) — ĐẶT Sử TOÀN CỤC
+# ============================================================
+# Phải đặt trước khi import Keras/TF để đảm bảo mọi operation đều deterministic.
+# Lưu ý: recurrent_dropout > 0 vẫn có thể không hoàn toàn deterministic trên GPU.
+tf.random.set_seed(42)
+np.random.seed(42)
 
 def evaluate_threshold_f1(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> float:
     """Tính F1-Score cho bài toán phân loại nhị phân: vượt ngưỡng vận hành hay không?"""
@@ -61,6 +87,8 @@ from config import (
     # [v6] Config riêng cho t+7d
     FEATURE_COLS_T7D, WINDOW_SIZE_T7D, LSTM_UNITS_T7D,
     DROPOUT_RATE_T7D, DENSE_UNITS_T7D, L2_REG_T7D, PATIENCE_T7D,
+    # [v7] Phase-Aware Loss + TLCC
+    LAMBDA_PHASE, LAMBDA_NSE, RAIN_LAG_EXTRA,
 )
 
 os.makedirs("models",  exist_ok=True)
@@ -143,6 +171,76 @@ def create_sequences(
         np.array(base_levels),
         np.array(sw),
     )
+
+
+# ============================================================
+# [v7] PHASE-AWARE LOSS — Kết hợp Huber + Phạt Độ Dốc + Thưởng NSE
+# ============================================================
+def build_phase_aware_loss(
+    lambda_phase: float = LAMBDA_PHASE,
+    lambda_nse:   float = LAMBDA_NSE,
+):
+    """
+    Loss tùy chỉnh chống trễ pha cho dự báo thủy văn.
+
+    Công thức:
+        L = Huber(δ=1.0)
+          + λ_phase * mean(|Δy_true − Δy_pred|)
+          − λ_nse   * NSE(y_true, y_pred)
+
+    Giải thích từng thành phần:
+      - Huber(δ=1.0)         : ít nhạy với outlier đỉnh lũ (giữ nguyên ưu điểm v5)
+      - λ_phase * grad_err   : phạt sai lệch độ dốc (cần sàt cùng xu hướng thực
+                               tế), giảm hiệu ứng đồ thị dịch phải d ngày
+      - λ_nse   * NSE        : thưởng mô hình có NSE cao — tối đa hoá tiêu
+                               chuẩn thủy văn Nash-Sutcliffe Efficiency
+
+    Parameters
+    ----------
+    lambda_phase : float
+        Trọng số penalty gradient (độ dốc). Mặc định 0.1.
+        Giảm xuống 0.05 nếu loss dao động mạnh trong quá trình train.
+    lambda_nse : float
+        Trọng số thưởng NSE. Mặc định 0.05.
+        Tăng lên 0.1 nếu muốn ưu tiên hiệu quả thủy văn.
+
+    Returns
+    -------
+    Callable
+        Hàm loss nhận (y_true, y_pred) trả về scalar tensor.
+    """
+    huber = tf.keras.losses.Huber(delta=1.0)
+
+    def _loss(y_true, y_pred):
+        # --- Thành phần 1: Huber Loss cơ bản ---
+        loss_val = huber(y_true, y_pred)
+
+        # --- Thành phần 2: Phạt sai lệch độ dốc (gradient phase penalty) ---
+        # Tính đạo hàm 1 bước thông qua central difference
+        # dy[i] = y[i+1] − y[i] — đưa về cùng khích thước bằng cách pad 0 ở cuối
+        if lambda_phase > 0.0:
+            dy_true = tf.concat(
+                [y_true[1:] - y_true[:-1], tf.zeros_like(y_true[:1])], axis=0
+            )
+            dy_pred = tf.concat(
+                [y_pred[1:] - y_pred[:-1], tf.zeros_like(y_pred[:1])], axis=0
+            )
+            phase_penalty = tf.reduce_mean(tf.abs(dy_true - dy_pred))
+            loss_val = loss_val + lambda_phase * phase_penalty
+
+        # --- Thành phần 3: Thưởng NSE (Nash-Sutcliffe Efficiency) ---
+        # NSE càng gần 1.0 → loss càng nhỏ → mô hình được thưởng
+        # tránh chia 0 khi y_true constant (ví dụ mùa khô mực nước ổn định)
+        if lambda_nse > 0.0:
+            y_mean   = tf.reduce_mean(y_true)
+            ss_res   = tf.reduce_sum(tf.square(y_true - y_pred))
+            ss_tot   = tf.reduce_sum(tf.square(y_true - y_mean))
+            nse_val  = 1.0 - ss_res / (ss_tot + 1e-8)
+            loss_val = loss_val - lambda_nse * nse_val
+
+        return loss_val
+
+    return _loss
 
 
 # ============================================================
@@ -350,39 +448,43 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
     từng feature vào mỗi dự báo — trả lời câu hỏi:
     "Tại sao mô hình dự báo mực nước cao/thấp tại thời điểm này?"
 
-    Đây là yêu cầu quan trọng trong nghiên cứu thủy văn:
-    mô hình "hộp đen" cần được giải thích để các nhà quản lý
-    hồ chứa tin tưởng và sử dụng kết quả dự báo.
-
     Parameters
     ----------
     model : keras.Model
-        Mô hình đã huấn luyện.
-    X_train, X_test : np.ndarray
-        Dữ liệu train (làm background) và test (giải thích).
+    X_train : np.ndarray  (background reference)
+    X_test  : np.ndarray  (data to explain)
     feature_cols : list of str
-        Tên các features.
     horizon_d : int
-        Khoảng dự báo tính bằng ngày (để đặt tên file lưu).
     """
     try:
         import shap
 
         logger.info("  [SHAP] Tính feature importance cho t+%dd...", horizon_d)
 
-        # Dùng 100 mẫu train làm background (tránh OOM)
-        background = X_train[:100]
-        test_sample = X_test[:50]
+        # Dùng tối đa 100 mẫu train làm background (tránh OOM)
+        n_bg = min(100, len(X_train))
+        n_te = min(50,  len(X_test))
+        background  = X_train[:n_bg]
+        test_sample = X_test[:n_te]
 
         # GradientExplainer phù hợp với model TensorFlow/Keras
         explainer   = shap.GradientExplainer(model, background)
         shap_values = explainer.shap_values(test_sample)
 
-        # shap_values shape: (n_test, window, n_features)
-        # Lấy mean absolute SHAP theo chiều time và sample
-        shap_arr = np.array(shap_values)
+        # shap_values có thể là list (multi-output) hoặc ndarray (single output)
+        if isinstance(shap_values, list):
+            shap_arr = np.array(shap_values[0])  # lấy output đầu tiên
+        else:
+            shap_arr = np.array(shap_values)
+
+        # Đảm bảo shape đúng: (n_samples, window, n_features)
         if shap_arr.ndim == 4:
             shap_arr = shap_arr[0]   # regression output index
+        if shap_arr.ndim != 3:
+            raise ValueError(
+                f"SHAP array shape không hợp lệ: {shap_arr.shape}, "
+                f"cần (n_samples, window, n_features)"
+            )
 
         mean_shap = np.abs(shap_arr).mean(axis=(0, 1))   # (n_features,)
 
@@ -392,7 +494,7 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
         sorted_feat = [feature_cols[i] for i in sorted_idx]
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        colors  = ["crimson" if "Q_out" in f or "dH" in f else "steelblue"
+        colors  = ["crimson" if "dH" in f or "delta" in f else "steelblue"
                    for f in sorted_feat]
         ax.barh(range(len(sorted_feat)), sorted_vals[::-1],
                 color=colors[::-1], edgecolor="white")
@@ -400,8 +502,7 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
         ax.set_yticklabels(sorted_feat[::-1], fontsize=9)
         ax.set_xlabel("Mean |SHAP value|")
         ax.set_title(
-            f"SHAP Feature Importance — Bi-LSTM t+{horizon_d}d\n"
-            "(Màu đỏ: features Q_out mới)",
+            f"SHAP Feature Importance — Bi-LSTM t+{horizon_d}d",
             fontweight="bold",
         )
         ax.grid(axis="x", alpha=0.3)
@@ -418,13 +519,17 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
             "mean_abs_shap": sorted_vals,
         })
         shap_df.to_csv(f"results/shap_values_t{horizon_d}d.csv", index=False)
+        logger.info("  [SHAP] Top 5 features: %s",
+                    dict(zip(sorted_feat[:5], sorted_vals[:5].round(6))))
 
     except ImportError:
         logger.warning(
-            "[SHAP] Thư viện 'shap' chưa được cài đặt."
+            "[SHAP] Thư viện 'shap' chưa được cài đặt. "
+            "Cài bằng: pip install shap"
         )
     except Exception as exc:
         logger.warning("[SHAP] Không thể tính SHAP: %s", exc)
+        logger.debug("[SHAP] Traceback:\n%s", traceback.format_exc())
 
 
 # ============================================================
@@ -559,9 +664,19 @@ def train_and_evaluate(
         dense_units=_dense_units,
         l2_reg=_l2_reg,
     )
+    # [v7] Phase-Aware Loss: Huber + gradient penalty + NSE reward
+    # Thay thế Huber đơn thuần — giảm trễ pha, tăng NSE thủy văn
+    _loss_fn = build_phase_aware_loss(
+        lambda_phase=LAMBDA_PHASE,
+        lambda_nse=LAMBDA_NSE,
+    )
+    logger.info(
+        "  [v7] Phase-Aware Loss: Huber + λ_phase=%.2f * grad_err − λ_nse=%.2f * NSE",
+        LAMBDA_PHASE, LAMBDA_NSE,
+    )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss=tf.keras.losses.Huber(delta=1.0),  # Huber: ít nhạy với outlier/đỉnh lũ
+        loss=_loss_fn,
         metrics=["mae"],
     )
 
@@ -710,17 +825,23 @@ def train_and_evaluate(
 
     if horizon_d == FORECAST_DAYS[0]:
         train_cfg = {
-            "version": "6.0",
+            "version": "7.0",
             "predict_delta_h": PREDICT_DELTA_H,
             "window_size": WINDOW_SIZE,
             "window_size_t7d": WINDOW_SIZE_T7D,
             "feature_cols": FEATURE_COLS,
             "feature_cols_t7d": FEATURE_COLS_T7D,
+            "feature_count": len(FEATURE_COLS),
+            "feature_count_t7d": len(FEATURE_COLS_T7D),
             "ensemble_persistence_weight": ENSEMBLE_PERSISTENCE_WEIGHT,
             "lstm_units": LSTM_UNITS,
             "lstm_units_t7d": LSTM_UNITS_T7D,
             "dropout_rate": DROPOUT_RATE,
             "dropout_rate_t7d": DROPOUT_RATE_T7D,
+            # [v7] Phase-Aware Loss
+            "lambda_phase": LAMBDA_PHASE,
+            "lambda_nse": LAMBDA_NSE,
+            "rain_lag_extra": RAIN_LAG_EXTRA,
         }
         _config_path = os.path.join("models", "train_config.json")
         with open(_config_path, "w", encoding="utf-8") as f:
@@ -736,115 +857,132 @@ def plot_results(df_result: pd.DataFrame, history,
                  horizon_d: int, metrics: dict,
                  n_features: int) -> None:
     """
-    Vẽ 2 biểu đồ:
-      1. Đường cong loss (train vs val)
-      2. Dự báo vs Thực tế theo valid_time (= issue_time + horizon)
-         — trục X là ngày mực nước được dự báo, tránh lệch 1 ngày trên đồ thị
+    Vẽ biểu đồ so sánh Dự báo vs Thực tế theo trục valid_time (thời điểm mực nước thực tế)
+    trên toàn bộ tập kiểm tra độc lập 2024-2025. Cấu trúc và định dạng giống hệt ảnh mẫu.
+    Đồng thời vẽ biểu đồ Loss Curve lưu riêng ra file results/loss_t{horizon_d}d.png.
     """
-    df_plot_src = df_result.copy()
-    if "valid_time" not in df_plot_src.columns:
-        issue_col = (
-            "issue_time" if "issue_time" in df_plot_src.columns else "timestamp"
-        )
-        df_plot_src["valid_time"] = (
-            pd.to_datetime(df_plot_src[issue_col])
-            + pd.to_timedelta(horizon_d, unit="D")
-        )
-    time_col = "valid_time"
-    fig, axes = plt.subplots(2, 1, figsize=(14, 11))
-    fig.suptitle(
-        f"LSTM v5 | t+{horizon_d}d | {n_features} features\n"
-        f"RMSE={metrics['rmse']:.4f}m | MAE={metrics['mae']:.4f}m | NSE={metrics['nse']:.4f}",
-        fontsize=12, fontweight="bold",
-    )
+    df_plot = df_result.copy()
 
-    # Biểu đồ 1: Loss curve
-    ax1 = axes[0]
-    ax1.plot(history.history["loss"],     label="Train Loss", color="steelblue")
-    ax1.plot(history.history["val_loss"], label="Val Loss",   color="orange")
-    ax1.set_xlabel("Epoch"); ax1.set_ylabel("Huber Loss (ΔH scaled)")
-    ax1.set_title(
-        "Đường cong hội tộ — Train (85% đầu) vs Val nội bộ (15% cuối train)\n"
-        "(Không dùng 2023 — tránh khe loss train/val giả)"
-    )
-    ax1.legend(); ax1.grid(alpha=0.3)
-
-    # Biểu đồ 2: trục X = valid_time (ngày mực nước t+d), không phải ngày phát hành
-    ax2 = axes[1]
-    yagi_mask = (
-        (df_plot_src[time_col] >= "2024-09-07")
-        & (df_plot_src[time_col] <= "2024-09-15")
-    )
-    df_plot = df_plot_src[yagi_mask] if yagi_mask.sum() >= 2 else df_plot_src.tail(100)
-    t_axis = df_plot[time_col]
-
-    ax2.plot(t_axis, df_plot["actual"],
-             label="Thực tế H(valid)", color="royalblue", linewidth=2)
-
-    use_aligned = (
-        APPLY_LAG_D_ALIGNMENT
-        and "predicted_aligned" in df_plot.columns
-        and df_plot["predicted_aligned"].notna().any()
-    )
-    if use_aligned:
-        ax2.plot(
-            t_axis, df_plot["predicted_aligned"],
-            label=f"Dự báo t+{horizon_d}d (đã căn lệch d ngày)",
-            color="tomato", linewidth=2.0,
+    # ── Đảm bảo cột issue_time và valid_time tồn tại ─────────────────────────
+    if "issue_time" not in df_plot.columns:
+        df_plot["issue_time"] = df_plot.get(
+            "timestamp", df_plot.index
         )
-        ax2.plot(
-            t_axis, df_plot["predicted"],
-            label="Trước căn (raw)",
-            color="darkorange", linewidth=1.0, linestyle="--", alpha=0.55,
+    df_plot["issue_time"] = pd.to_datetime(df_plot["issue_time"])
+    if "valid_time" not in df_plot.columns:
+        df_plot["valid_time"] = (
+            df_plot["issue_time"] + pd.to_timedelta(horizon_d, unit="D")
         )
-        lo_col, hi_col = "ci95_lower_aligned", "ci95_upper_aligned"
-        if lo_col in df_plot.columns and df_plot[lo_col].notna().any():
-            ax2.fill_between(
-                t_axis, df_plot[lo_col], df_plot[hi_col],
-                alpha=0.20, color="tomato", label="CI95 (đã căn)",
-            )
-    else:
-        ax2.plot(
-            t_axis, df_plot["predicted"],
-            label=f"Dự báo t+{horizon_d}d",
-            color="tomato", linewidth=1.5, linestyle="--",
-        )
-        ax2.fill_between(
-            t_axis, df_plot["ci95_lower"], df_plot["ci95_upper"],
-            alpha=0.20, color="tomato", label="Khoảng tin cậy 95%",
-        )
+    df_plot["valid_time"] = pd.to_datetime(df_plot["valid_time"])
+    df_plot = df_plot.sort_values("valid_time").reset_index(drop=True)
 
+    # ── 1. VẼ BIỂU ĐỒ DỰ BÁO VẬN HÀNH (TRỤC VALID_TIME) ───────────────────────
+    fig, ax = plt.subplots(figsize=(16, 5))
+    t = df_plot["valid_time"]
+
+    # Vùng khoảng tin cậy 95% (MC Dropout)
+    if "ci95_lower" in df_plot.columns and "ci95_upper" in df_plot.columns:
+        ax.fill_between(t, df_plot["ci95_lower"], df_plot["ci95_upper"],
+                        alpha=0.15, color="tomato", label="Khoang tin cay 95% (MC Dropout)",
+                        zorder=1)
+
+    # Đường thực tế H(t)
+    ax.plot(t, df_plot["actual"],
+            label="Thuc te H(t)",
+            color="royalblue", linewidth=1.8, zorder=3)
+
+    # Đường dự báo t+d
+    ax.plot(t, df_plot["predicted"],
+            label=f"Du bao Bi-LSTM t+{horizon_d}d",
+            color="tomato", linewidth=1.5, linestyle="--", zorder=4)
+
+    # Đường Naive Persistence để so sánh
     if "persistence" in df_plot.columns:
-        ax2.plot(
-            t_axis, df_plot["persistence"],
-            label="Naive H(ngày phát hành)",
-            color="gray", linewidth=1.0, linestyle=":",
+        ax.plot(t, df_plot["persistence"],
+                color="gray", linewidth=0.8, linestyle=":",
+                label="Naive H(t) (persistence)", zorder=2, alpha=0.7)
+
+    # Vẽ các ngưỡng vận hành (MNDBT và Ngưỡng xả lũ)
+    from config import MNDBT
+    ax.axhline(MNDBT, color="darkorange", linestyle="-.", linewidth=1.0, alpha=0.9,
+               label=f"MNDBT = {MNDBT} m")
+    ax.axhline(46.50, color="crimson", linestyle="-.", linewidth=1.0, alpha=0.9,
+               label="Nguong xa lu = 46.5 m")
+
+    # Đánh dấu vùng Bão Yagi (màu vàng nhạt)
+    yagi_s = pd.Timestamp("2024-09-07")
+    yagi_e = pd.Timestamp("2024-09-15")
+    ax.axvspan(yagi_s, yagi_e, alpha=0.12, color="gold", zorder=0,
+               label="Bao Yagi 09/2024")
+
+    # Annotate đỉnh lũ Yagi
+    yagi_data = df_plot[(df_plot["valid_time"] >= yagi_s) & (df_plot["valid_time"] <= yagi_e)]
+    if len(yagi_data) > 0:
+        max_yagi_act = yagi_data["actual"].max()
+        ax.annotate(
+            f"Bao Yagi\n(actual = {max_yagi_act:.2f}m)",
+            xy=(yagi_s + pd.Timedelta(days=1.5), max_yagi_act),
+            xytext=(yagi_s - pd.Timedelta(days=22), df_plot["actual"].max() - 0.2),
+            fontsize=8, color="darkred", fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color="darkred", lw=1.0),
         )
 
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
-    ax2.xaxis.set_major_locator(mdates.DayLocator(interval=1 if len(df_plot) < 20 else 7))
-    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
-    ax2.set_xlabel("Ngày mực nước được dự báo (valid time)")
-    ax2.set_ylabel("Mực nước (m)")
-    align_note = (
-        " — hiển thị đã căn lệch d (post-process)"
-        if use_aligned else ""
+    # Đánh dấu vùng Bão Matmo 10/2025 (nếu có dữ liệu)
+    matmo_s = pd.Timestamp("2025-10-01")
+    matmo_e = pd.Timestamp("2025-10-10")
+    if (df_plot["valid_time"] >= matmo_s).any():
+        ax.axvspan(matmo_s, matmo_e, alpha=0.10, color="lightblue", zorder=0,
+                   label="Bao Matmo 10/2025")
+
+    # Định dạng trục X (Thời gian hiển thị tháng/năm)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%Y"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=9)
+
+    ax.set_xlabel("Ngay (valid_time)", fontsize=11)
+    ax.set_ylabel("Muc nuoc (m)", fontsize=11)
+
+    nse_val = metrics.get("nse")
+    rmse_val = metrics.get("rmse")
+    mae_val = metrics.get("mae")
+
+    ax.set_title(
+        f"Bi-LSTM Du bao muc nuoc ho Nui Coc  |  Chan troi t+{horizon_d}d  "
+        f"|  Toan bo tap kiem tra doc lap 2024-2025 ({len(df_plot)} ngay)\n"
+        f"RMSE = {rmse_val:.4f} m    MAE = {mae_val:.4f} m    NSE = {nse_val:.4f}",
+        fontsize=11, fontweight="bold",
     )
-    nse_al = metrics.get("nse_aligned")
-    sub = (
-        f"NSE (căn lệch)={nse_al:.4f} | " if nse_al is not None else ""
-    )
-    ax2.set_title(
-        f"Dự báo vs Thực tế — Lũ Yagi 9/2024 (t+{horizon_d}d){align_note}\n"
-        f"({sub}đường đỏ = pred_aligned, gạch cam = raw)"
-    )
-    ax2.legend(); ax2.grid(alpha=0.3)
+    ax.legend(loc="upper left", fontsize=8, ncol=2)
+    ax.grid(alpha=0.25)
+
+    # Thiết lập khoảng giới hạn trục Y
+    y_min = df_plot[["actual", "predicted"]].min().min() - 0.3
+    y_max = df_plot[["actual", "predicted"]].max().max() + 0.5
+    ax.set_ylim(y_min, y_max)
 
     plt.tight_layout()
     save_path = f"results/plot_t{horizon_d}d.png"
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
     logger.info("  [Biểu đồ] Đã lưu: %s", save_path)
+
+    # ── 2. VẼ BIỂU ĐỒ LOSS CURVE RIÊNG BIỆT ──────────────────────────────────
+    if history is not None and hasattr(history, "history") and "loss" in history.history:
+        fig_loss, ax_loss = plt.subplots(figsize=(10, 5))
+        ax_loss.plot(history.history["loss"], label="Train Loss", color="steelblue", linewidth=1.8)
+        if "val_loss" in history.history:
+            ax_loss.plot(history.history["val_loss"], label="Val Loss", color="darkorange", linewidth=1.8)
+        ax_loss.set_xlabel("Epoch", fontsize=11)
+        ax_loss.set_ylabel("Phase-Aware Loss (ΔH scaled)", fontsize=11)
+        ax_loss.set_title(f"Quá trình hội tụ hàm tổn thất (Loss Curve) — Bi-LSTM t+{horizon_d}d", fontsize=12, fontweight="bold")
+        ax_loss.legend(fontsize=10)
+        ax_loss.grid(alpha=0.25)
+
+        plt.tight_layout()
+        loss_save_path = f"results/loss_t{horizon_d}d.png"
+        plt.savefig(loss_save_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("  [Biểu đồ Loss] Đã lưu: %s", loss_save_path)
 
 
 # ============================================================
@@ -857,7 +995,7 @@ def print_summary_table(all_metrics: dict) -> None:
     Chi so Val chi hien thi de tham khao kiem tra overfitting.
     """
     print("\n" + "=" * 90)
-    print("  BANG TONG HOP — Bi-LSTM v5.1 (Ho Nui Coc)")
+    print("  BANG TONG HOP — Bi-LSTM (Ho Nui Coc)")
     print("  [BAO CAO CHINH: Val 2024-2025 — bao gom lu Yagi 9/2024]")
     print("=" * 90)
     print(
