@@ -141,7 +141,7 @@ Sau khi khoi dong, truy cap:
 
 ## Bo dac trung dau vao
 
-### Bo features chuan (16 features — dung cho t+1d, t+3d, t+14d, t+30d)
+### Bo features chuan (15 features — dung cho t+1d, t+3d, t+14d, t+30d)
 
 | Nhom | Features | Mo ta |
 |------|---------|-------|
@@ -149,12 +149,12 @@ Sau khi khoi dong, truy cap:
 | **Khi tuong** | `temperature`, `humidity` | Nhiet do (°C), Do am (%) |
 | **Lag muc nuoc** | `water_level_lag7`, `water_level_lag14`, `water_level_lag30` | Muc nuoc tre 7/14/30 ngay (m) |
 | **Rolling stats** | `water_level_roll7`, `water_level_std7` | TB truot 7 ngay & Do lech chuan (m) |
-| **Temporal** | `month_sin`, `month_cos` | Ma hoa tuan hoan thang (cyclical encoding) |
-| **Temporal** | `season_wet`, `season_dry` | Mua mua (thang 5-10) / kho (thang 11-4) |
+| **Temporal** | `month_sin`, `month_cos` | Ma hoa tuan hoan thang (Month 1-12) |
+| **Temporal** | `season_wet` | Mua mua (thang 5-10) |
 
-### Bo features mo rong (21 features — dung rieng cho t+7d)
+### Bo features mo rong (20 features — dung rieng cho t+7d)
 
-Giu nguyen 16 features tren, bo sung them:
+Giu nguyen 15 features tren, bo sung them:
 
 | Feature | Mo ta |
 |---------|-------|
@@ -187,7 +187,7 @@ Giu nguyen 16 features tren, bo sung them:
 ### Kien truc chuan (t+1d, t+3d, t+14d, t+30d)
 
 ```
-Input (window=21 ngay, 16 features)
+Input (window=21 ngay, 15 features)
     │
     ▼
 Bidirectional(LSTM(64 units, recurrent_dropout=0.2))
@@ -210,7 +210,7 @@ Hau xu ly: ΔH → H(t+d) = H(t) + ΔH (inverse_transform)
 ### Kien truc mo rong rieng cho t+7d
 
 ```
-Input (window=45 ngay, 21 features)
+Input (window=45 ngay, 20 features)
     │
     ▼
 Bidirectional(LSTM(96 units, recurrent_dropout=0.2))

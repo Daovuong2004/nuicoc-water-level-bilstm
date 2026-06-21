@@ -25,6 +25,8 @@ ENV/
 data/raw/
 data/processed/
 data/final/
+data/nasa_raw/
+data/*.csv
 data/raw/checkpoints/
 data/raw/checkpoints_gee/
 
@@ -38,14 +40,19 @@ models/*.keras
 models/*.h5
 models/*.pkl
 models/*.pt
-# Cho phép commit file README mô hình
+# Cho phép commit file cấu hình mô hình
 !models/.gitkeep
+!models/train_config.json
 
 # ── Kết quả / Biểu đồ ─────────────────────────────────────────
 results/*.png
 results/*.csv
 results/*.json
 !results/.gitkeep
+
+# ── Word Documents / Reports (không phải mã nguồn) ────────────
+*.docx
+~$*.docx
 
 # ── TensorFlow / Keras cache ──────────────────────────────────
 *.tfevents.*

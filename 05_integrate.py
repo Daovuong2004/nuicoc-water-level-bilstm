@@ -689,10 +689,16 @@ def build_daily_features(
     df["delta_h_30d"] = df["water_level_m"] - df["water_level_m"].shift(30)
 
     # --- Temporal encoding (tuần hoàn) ---
+    # Chú thích: df.index.month của pandas trả về giá trị 1-12 (1-indexed).
+    # Công thức sin/cos sử dụng giá trị Month thực tế này để đồng bộ và tránh lệch pha.
     df["month_sin"]  = np.sin(2 * np.pi * df.index.month / 12)
     df["month_cos"]  = np.cos(2 * np.pi * df.index.month / 12)
+    
+    # Biến mùa chỉ thị: Mùa mưa lũ được định nghĩa từ tháng 5 đến tháng 10 hàng năm (dựa trên
+    # quy trình vận hành hồ chứa Núi Cốc và quy luật khí hậu đặc thù vùng Đông Bắc Bộ).
     df["season_wet"] = df.index.month.isin([5, 6, 7, 8, 9, 10]).astype(int)
-    df["season_dry"] = df.index.month.isin([11, 12, 1, 2, 3, 4]).astype(int)
+    # Ghi chú học thuật: Loại bỏ cột 'season_dry' (isin([11, 12, 1, 2, 3, 4])) để loại bỏ hiện tượng
+    # đa cộng tuyến hoàn hảo (multicollinearity) do season_dry = 1 - season_wet, giúp mô hình ổn định hơn.
 
     logger.info(
         "  Features v6: %d cột x %d ngày | mực nước %.2f-%.2fm",

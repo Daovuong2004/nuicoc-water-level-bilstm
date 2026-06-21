@@ -75,18 +75,24 @@ PREDICT_DELTA_H = True          # Học ΔH = H(t+d) - H(t)
 TARGET_DELTA_PREFIX = "target_delta_t"
 
 # ============================================================
-# FEATURES (20 — không gồm water_level_m, lag1/3 — chống học vẹt)
+# FEATURES (19 — không gồm water_level_m, lag1/3 — chống học vẹt)
 # ============================================================
 # Không dùng lag1/lag3 mực nước — gây học vẹt H(t) ≈ H(t+d) → đỉnh lệch d ngày
 # [v7] Thêm rain_1d_lag1/2/3/5: lag mưa từ TLCC cho tín hiệu dẫn đường thủy văn.
 #      Mưa (t-k) → mực nước (t) có tương quan cao nhất tại k=2-3 ngày (hồ Núi Cốc).
 #      Các lag này giúp mô hình học phản ứng trước khi mực nước thực sự dâng/hạ.
+# [CHÚ THÍCH KHOA HỌC VỀ ĐẶC TRƯNG CHU KỲ & MÙA]:
+#   - Month trong month_sin/cos được chuẩn hóa theo tỷ lệ (1 đến 12) / 12 (1-indexed).
+#     Đảm bảo tính nhất quán tránh lệch pha chu kỳ tháng khi tái thực nghiệm.
+#   - Chỉ giữ duy nhất đặc trưng season_wet (1 cho mùa mưa, 0 cho mùa khô).
+#     Đã loại bỏ season_dry do season_dry = 1 - season_wet gây ra hiện tượng đa cộng tuyến hoàn hảo,
+#     làm mất tính ổn định khi tối ưu hóa trọng số của lớp nơ-ron hồi quy.
 FEATURE_COLS = [
     "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
     "temperature", "humidity",
     "water_level_lag7", "water_level_lag14", "water_level_lag30",
     "water_level_roll7", "water_level_std7",
-    "month_sin", "month_cos", "season_wet", "season_dry",
+    "month_sin", "month_cos", "season_wet",
     # [v7] Lag mưa theo TLCC — tín hiệu dẫn đường, chống trễ pha
     "rain_1d_lag1", "rain_1d_lag2", "rain_1d_lag3", "rain_1d_lag5",
 ]
@@ -94,7 +100,7 @@ FEATURE_COLS = [
 FEATURE_COUNT = len(FEATURE_COLS)
 
 # ============================================================
-# FEATURES MỞ RỘNG CHO t+7d (25 features — thêm lag mưa TLCC + dài hạn)
+# FEATURES MỞ RỘNG CHO t+7d (24 features — thêm lag mưa TLCC + dài hạn)
 # ============================================================
 # Lý do: t+7d cần nắm xu hướng 60-90 ngày (quán tính thủy văn dài)
 # Các features thêm so với FEATURE_COLS:
@@ -105,12 +111,12 @@ FEATURE_COUNT = len(FEATURE_COLS)
 #   delta_h_30d   : H(t)-H(t-30) — momentum tăng/giảm 1 tháng gần nhất
 #   [v7] rain_1d_lag1/2/3/5 — lag mưa TLCC (giống FEATURE_COLS)
 FEATURE_COLS_T7D = [
-    # --- Giữ nguyên 16 features gốc ---
+    # --- Giữ nguyên 15 features gốc ---
     "rain_1d", "rain_3d", "rain_7d", "rain_14d", "rain_30d",
     "temperature", "humidity",
     "water_level_lag7", "water_level_lag14", "water_level_lag30",
     "water_level_roll7", "water_level_std7",
-    "month_sin", "month_cos", "season_wet", "season_dry",
+    "month_sin", "month_cos", "season_wet",
     # --- Thêm 5 features dài hạn ---
     "rain_60d",
     "water_level_lag60",

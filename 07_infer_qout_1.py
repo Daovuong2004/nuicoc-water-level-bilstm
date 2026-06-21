@@ -34,8 +34,8 @@ OUTPUT_PATH = "data/final/dataset_with_qout.csv"
 os.makedirs("results", exist_ok=True)
 
 # Ngưỡng phát hiện xả đột ngột
-QOUT_THRESHOLD  = 200    # m³/s — lưu lượng tối thiểu để coi là "đang xả lớn"
-DH_THRESHOLD    = -0.05  # m/h  — mực nước phải đang giảm
+QOUT_THRESHOLD  = 100    # m³/s — lưu lượng tối thiểu để coi là "đang xả lớn"
+DH_THRESHOLD    = -0.05  # m/ngày — mực nước phải đang giảm
 RAIN_THRESHOLD  = 5      # mm/6h — mưa nhỏ (loại trừ giảm do không mưa tự nhiên)
 
 # ============================================================
@@ -87,7 +87,7 @@ def infer_qout(df):
     df["area_m2"] = df["water_level_m"].apply(area_from_level)
 
     # 3. Tốc độ thay đổi dung tích (m³/s)
-    df["dS_dt_m3s"] = (df["area_m2"] * df["dH_dt"]) / 3600.0
+    df["dS_dt_m3s"] = (df["area_m2"] * df["dH_dt"]) / 86400.0
 
     # 4. Lưu lượng xả ước tính
     #    Nếu không có q_in_m3s thì dùng 0 (chỉ tính từ biến thiên mực nước)

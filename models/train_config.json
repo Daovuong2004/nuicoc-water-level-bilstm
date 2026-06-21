@@ -19,7 +19,6 @@
     "month_sin",
     "month_cos",
     "season_wet",
-    "season_dry",
     "rain_1d_lag1",
     "rain_1d_lag2",
     "rain_1d_lag3",
@@ -41,7 +40,6 @@
     "month_sin",
     "month_cos",
     "season_wet",
-    "season_dry",
     "rain_60d",
     "water_level_lag60",
     "water_level_roll30",
@@ -52,8 +50,8 @@
     "rain_1d_lag3",
     "rain_1d_lag5"
   ],
-  "feature_count": 20,
-  "feature_count_t7d": 25,
+  "feature_count": 19,
+  "feature_count_t7d": 24,
   "ensemble_persistence_weight": 0.0,
   "lstm_units": [
     64

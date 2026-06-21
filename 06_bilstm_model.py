@@ -479,7 +479,7 @@ def compute_shap_importance(model: Model, X_train: np.ndarray,
 
         # Đảm bảo shape đúng: (n_samples, window, n_features)
         if shap_arr.ndim == 4:
-            shap_arr = shap_arr[0]   # regression output index
+            shap_arr = shap_arr[:, :, :, 0]   # regression output index
         if shap_arr.ndim != 3:
             raise ValueError(
                 f"SHAP array shape không hợp lệ: {shap_arr.shape}, "

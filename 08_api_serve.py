@@ -69,6 +69,8 @@ from config import (
     NGUY_HIEM,
     MODEL_DIR,
     SCALER_PATH,
+    WINDOW_SIZE_T7D,
+    FEATURE_COLS_T7D,
 )
 
 # ---------------------------------------------------------------------------
@@ -165,7 +167,7 @@ def load_models_and_scaler() -> tuple[dict, object, dict]:
         model_path = os.path.join(MODEL_DIR, f"bilstm_t{d}d.keras")
         if os.path.exists(model_path):
             try:
-                trained_model = load_model(model_path)
+                trained_model = load_model(model_path, compile=False)
                 models_dict[d] = trained_model
                 logger.info("Đã tải model t%dd thành công: %s", d, model_path)
             except Exception as exc:
@@ -493,8 +495,6 @@ async def forecast_from_date(date: Optional[str] = None) -> dict:
     if missing:
         raise HTTPException(status_code=503, detail=f"Dataset thiếu cột: {missing}")
 
-    window        = df.iloc[end_pos - WINDOW_SIZE + 1 : end_pos + 1]
-    X_raw         = window[FEATURE_COLS].values.astype("float32")
     base_level_m  = float(df.loc[end_date, "water_level_m"])
     issue_date    = str(end_date.date())
 
@@ -506,19 +506,43 @@ async def forecast_from_date(date: Optional[str] = None) -> dict:
     if not models:
         raise HTTPException(status_code=503, detail="Chưa có model nào được tải.")
 
-    X_scaled = scaler.transform(X_raw)
-    X_input  = X_scaled[np.newaxis, ...]          # (1, 21, 16)
+    # 1. Đầu vào cho các mô hình 21 ngày:
+    window_21 = df.iloc[end_pos - WINDOW_SIZE + 1 : end_pos + 1]
+    X_raw_21 = window_21[FEATURE_COLS].values.astype("float32")
+    X_scaled_21 = scaler.transform(X_raw_21)
+    X_input_21 = X_scaled_21[np.newaxis, ...]
+
+    # 2. Đầu vào cho mô hình 45 ngày (t+7d):
+    X_input_45 = None
+    missing_t7 = [c for c in FEATURE_COLS_T7D if c not in df.columns]
+    if not missing_t7 and end_pos >= WINDOW_SIZE_T7D - 1:
+        window_45 = df.iloc[end_pos - WINDOW_SIZE_T7D + 1 : end_pos + 1]
+        X_raw_45 = window_45[FEATURE_COLS_T7D].copy()
+        X_raw_45[FEATURE_COLS] = scaler.transform(X_raw_45[FEATURE_COLS])
+        X_input_45 = X_raw_45.values.astype("float32")[np.newaxis, ...]
+    else:
+        logger.warning("Không đủ dữ liệu lịch sử hoặc thiếu cột để dự báo t+7d cho ngày %s: %s", end_date.date(), missing_t7)
 
     forecasts   = []
     models_used = []
     for d in FORECAST_DAYS:
         if d not in models:
             continue
+
+        # Chọn input shape tương thích
+        if d == 7:
+            if X_input_45 is None:
+                logger.warning("Bỏ qua t+7d do không chuẩn bị được đầu vào (cần %d ngày)", WINDOW_SIZE_T7D)
+                continue
+            X_in = X_input_45
+        else:
+            X_in = X_input_21
+
         target_scaler = app_state["target_scalers"].get(d)
         try:
             mean_wl, ci_lo, ci_hi = predict_with_mc_dropout(
                 model=models[d],
-                X_input=X_input,
+                X_input=X_in,
                 base_level_m=base_level_m,
                 target_scaler=target_scaler,
             )
@@ -642,11 +666,19 @@ async def forecast_realtime(req: RealtimeRequest) -> dict:
     lag7 = wl_lag(7)
     lag14 = wl_lag(14)
     lag30 = wl_lag(30)
+    lag60 = wl_lag(60)
 
     # --- Rolling water level ---
     recent7_vals = hist["water_level_m"].values[-6:].tolist() + [H_today]
     roll7 = float(np.mean(recent7_vals))
     std7 = float(np.std(recent7_vals))
+
+    recent30_vals = hist["water_level_m"].values[-29:].tolist() + [H_today]
+    roll30 = float(np.mean(recent30_vals))
+
+    # --- Delta H ---
+    dh7 = H_today - lag7
+    dh30 = H_today - lag30
 
     # --- Rainfall tích lũy ---
     def rain_sum(days: int) -> float:
@@ -654,13 +686,26 @@ async def forecast_realtime(req: RealtimeRequest) -> dict:
         window_rain = hist[hist.index >= start]["rain_1d"].sum() if "rain_1d" in hist.columns else 0.0
         return float(window_rain) + rain_today
 
+    # --- Rainfall lag ---
+    def rain_lag(days: int) -> float:
+        target = today - pd.Timedelta(days=days)
+        avail = hist.index[hist.index <= target]
+        return float(hist.loc[avail[-1], "rain_1d"]) if (len(avail) > 0 and "rain_1d" in hist.columns) else 0.0
+
+    lag_rain1 = rain_lag(1)
+    lag_rain2 = rain_lag(2)
+    lag_rain3 = rain_lag(3)
+    lag_rain5 = rain_lag(5)
+
     # --- Month encoding ---
+    # Chú thích: month là chỉ số tháng thực tế từ 1-12 (1-indexed).
     month_sin = _math.sin(2 * _math.pi * month / 12)
     month_cos = _math.cos(2 * _math.pi * month / 12)
     season_wet = 1.0 if month in [5, 6, 7, 8, 9, 10] else 0.0
 
     # --- Hàng đặc trưng hôm nay ---
     today_row = {
+        # 15 features gốc (đã bỏ season_dry để chống đa cộng tuyến hoàn hảo):
         "rain_1d": rain_today, "rain_3d": rain_sum(3),
         "rain_7d": rain_sum(7), "rain_14d": rain_sum(14),
         "rain_30d": rain_sum(30), "temperature": clim_temp,
@@ -668,20 +713,33 @@ async def forecast_realtime(req: RealtimeRequest) -> dict:
         "water_level_lag14": lag14, "water_level_lag30": lag30,
         "water_level_roll7": roll7, "water_level_std7": std7,
         "month_sin": month_sin, "month_cos": month_cos,
-        "season_wet": season_wet, "season_dry": 1.0 - season_wet,
+        "season_wet": season_wet,
         "water_level_m": H_today,
+        # lag mưa TLCC:
+        "rain_1d_lag1": lag_rain1,
+        "rain_1d_lag2": lag_rain2,
+        "rain_1d_lag3": lag_rain3,
+        "rain_1d_lag5": lag_rain5,
+        # 5 features dài hạn cho t+7d:
+        "rain_60d": rain_sum(60),
+        "water_level_lag60": lag60,
+        "water_level_roll30": roll30,
+        "delta_h_7d": dh7,
+        "delta_h_30d": dh30,
     }
 
-    # --- Ghép cửa sổ 21 ngày: 20 ngày lịch sử + hôm nay ---
-    hist20 = hist.tail(WINDOW_SIZE - 1)
+    # --- Ghép cửa sổ 21 ngày và 45 ngày ---
+    hist_needed = hist.tail(WINDOW_SIZE_T7D - 1)
     today_df = pd.DataFrame([today_row], index=[today])
-    window_df = pd.concat([hist20, today_df]).tail(WINDOW_SIZE)
+    window_df_full = pd.concat([hist_needed, today_df]).tail(WINDOW_SIZE_T7D)
 
-    missing = [c for c in FEATURE_COLS if c not in window_df.columns]
-    if missing:
-        raise HTTPException(status_code=503, detail=f"Thiếu features: {missing}")
-
-    X_raw = window_df[FEATURE_COLS].values.astype("float32")
+    # 1. Đầu vào cho các mô hình 21 ngày:
+    window_21 = window_df_full.tail(WINDOW_SIZE)
+    missing_21 = [c for c in FEATURE_COLS if c not in window_21.columns]
+    if missing_21:
+        raise HTTPException(status_code=503, detail=f"Thiếu features 21 ngày: {missing_21}")
+    X_raw_21 = window_21[FEATURE_COLS].values.astype("float32")
+    
     scaler = app_state["scaler"]
     models = app_state["models"]
     if scaler is None:
@@ -689,18 +747,39 @@ async def forecast_realtime(req: RealtimeRequest) -> dict:
     if not models:
         raise HTTPException(status_code=503, detail="Chưa có model nào được tải.")
 
-    X_scaled = scaler.transform(X_raw)
-    X_input = X_scaled[np.newaxis, ...]
+    X_scaled_21 = scaler.transform(X_raw_21)
+    X_input_21 = X_scaled_21[np.newaxis, ...]
+
+    # 2. Đầu vào cho mô hình 45 ngày (t+7d):
+    X_input_45 = None
+    missing_45 = [c for c in FEATURE_COLS_T7D if c not in window_df_full.columns]
+    if not missing_45 and len(window_df_full) >= WINDOW_SIZE_T7D:
+        window_45 = window_df_full.tail(WINDOW_SIZE_T7D)
+        X_raw_45 = window_45[FEATURE_COLS_T7D].copy()
+        X_raw_45[FEATURE_COLS] = scaler.transform(X_raw_45[FEATURE_COLS])
+        X_input_45 = X_raw_45.values.astype("float32")[np.newaxis, ...]
+    else:
+        logger.warning("Không đủ dữ liệu lịch sử hoặc thiếu cột cho t+7d: %s", missing_45)
 
     forecasts = []
     models_used = []
     for d in FORECAST_DAYS:
         if d not in models:
             continue
+        
+        # Chọn input shape tương thích
+        if d == 7:
+            if X_input_45 is None:
+                logger.warning("Bỏ qua t+7d do không chuẩn bị được đầu vào (cần %d ngày)", WINDOW_SIZE_T7D)
+                continue
+            X_in = X_input_45
+        else:
+            X_in = X_input_21
+
         target_scaler = app_state["target_scalers"].get(d)
         try:
             mean_wl, ci_lo, ci_hi = predict_with_mc_dropout(
-                model=models[d], X_input=X_input,
+                model=models[d], X_input=X_in,
                 base_level_m=H_today, target_scaler=target_scaler,
             )
         except Exception as exc:
@@ -1028,7 +1107,7 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
     Endpoint dự báo mực nước hồ Núi Cốc.
 
     Quy trình xử lý:
-        1. Kiểm tra shape đầu vào (60, 26)
+        1. Kiểm tra shape đầu vào (WINDOW_SIZE, FEATURE_COUNT)
         2. Chuẩn hoá đặc trưng bằng feature scaler
         3. Với mỗi horizon d có model: gọi Monte Carlo Dropout prediction
         4. Tính mức cảnh báo dựa trên mực nước dự báo cao nhất
@@ -1075,20 +1154,20 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             )
 
     # ---- Chuyển thành numpy array và chuẩn hoá ----
-    # X_raw: shape (60, 26)
+    # X_raw: shape (WINDOW_SIZE, FEATURE_COUNT)
     X_raw = np.array(features_raw, dtype=np.float32)
 
     try:
-        # Scaler được fit trên shape (n_samples, 26) — reshape 2D trước khi transform
-        X_scaled = scaler.transform(X_raw)  # shape (60, 26)
+        # Scaler được fit trên shape (n_samples, FEATURE_COUNT)
+        X_scaled = scaler.transform(X_raw)  # shape (WINDOW_SIZE, FEATURE_COUNT)
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi chuẩn hoá đặc trưng: {exc}",
         ) from exc
 
-    # Thêm chiều batch: shape (1, 60, 26) để đưa vào model
-    X_input = X_scaled[np.newaxis, ...]  # shape (1, 60, 26)
+    # Thêm chiều batch: shape (1, WINDOW_SIZE, FEATURE_COUNT) để đưa vào model
+    X_input = X_scaled[np.newaxis, ...]  # shape (1, WINDOW_SIZE, FEATURE_COUNT)
 
     # ---- Dự báo từng chân trời ----
     forecasts: list[HorizonForecast] = []
@@ -1101,6 +1180,15 @@ async def predict(request: ForecastRequest) -> ForecastResponse:
             continue
 
         model = models[d]
+        # Kiểm tra tính tương thích của shape đầu vào để tránh crash khi gọi predict
+        expected_shape = model.input_shape
+        if expected_shape[1] is not None and X_input.shape[1] != expected_shape[1]:
+            logger.warning("Bỏ qua t%dd trong /predict do không khớp chiều dài cửa sổ (nhận %d, chờ %d)", d, X_input.shape[1], expected_shape[1])
+            continue
+        if expected_shape[2] is not None and X_input.shape[2] != expected_shape[2]:
+            logger.warning("Bỏ qua t%dd trong /predict do không khớp số đặc trưng (nhận %d, chờ %d)", d, X_input.shape[2], expected_shape[2])
+            continue
+
         target_scaler = app_state["target_scalers"].get(d)
         try:
             mean_wl, ci_lower, ci_upper = predict_with_mc_dropout(
@@ -1172,8 +1260,8 @@ async def health() -> HealthResponse:
     Trả về:
         - status: 'ok' nếu đủ model và scaler, 'degraded' nếu thiếu
         - models_loaded: danh sách chân trời (ngày) đã có model sẵn sàng
-        - feature_count: số đặc trưng đầu vào (16)
-        - window_size: kích thước cửa sổ thời gian (21 ngày)
+        - feature_count: số đặc trưng đầu vào (FEATURE_COUNT)
+        - window_size: kích thước cửa sổ thời gian (WINDOW_SIZE ngày)
         - scaler_loaded: True nếu scaler đã tải thành công
     """
     models: dict = app_state["models"]
