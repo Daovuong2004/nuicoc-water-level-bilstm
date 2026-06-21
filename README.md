@@ -141,7 +141,7 @@ Sau khi khoi dong, truy cap:
 
 ## Bo dac trung dau vao
 
-### Bo features chuan (15 features — dung cho t+1d, t+3d, t+14d, t+30d)
+### Bo features chuan (19 features — dung cho t+1d, t+3d, t+14d, t+30d)
 
 | Nhom | Features | Mo ta |
 |------|---------|-------|
@@ -150,11 +150,12 @@ Sau khi khoi dong, truy cap:
 | **Lag muc nuoc** | `water_level_lag7`, `water_level_lag14`, `water_level_lag30` | Muc nuoc tre 7/14/30 ngay (m) |
 | **Rolling stats** | `water_level_roll7`, `water_level_std7` | TB truot 7 ngay & Do lech chuan (m) |
 | **Temporal** | `month_sin`, `month_cos` | Ma hoa tuan hoan thang (Month 1-12) |
-| **Temporal** | `season_wet` | Mua mua (thang 5-10) |
+| **Temporal** | `season_wet` | Mua mua (thang 5-10), da loai bo `season_dry` de tranh da cong tuyen hoan hao |
+| **Lag mua TLCC** | `rain_1d_lag1`, `rain_1d_lag2`, `rain_1d_lag3`, `rain_1d_lag5` | Lag mua 1/2/3/5 ngay tu phan tich tuong quan cheo (TLCC) |
 
-### Bo features mo rong (20 features — dung rieng cho t+7d)
+### Bo features mo rong (24 features — dung rieng cho t+7d)
 
-Giu nguyen 15 features tren, bo sung them:
+Giu nguyen 19 features tren, bo sung them:
 
 | Feature | Mo ta |
 |---------|-------|
@@ -187,7 +188,7 @@ Giu nguyen 15 features tren, bo sung them:
 ### Kien truc chuan (t+1d, t+3d, t+14d, t+30d)
 
 ```
-Input (window=21 ngay, 15 features)
+Input (window=21 ngay, 19 features)
     │
     ▼
 Bidirectional(LSTM(64 units, recurrent_dropout=0.2))
@@ -210,7 +211,7 @@ Hau xu ly: ΔH → H(t+d) = H(t) + ΔH (inverse_transform)
 ### Kien truc mo rong rieng cho t+7d
 
 ```
-Input (window=45 ngay, 20 features)
+Input (window=45 ngay, 24 features)
     │
     ▼
 Bidirectional(LSTM(96 units, recurrent_dropout=0.2))
@@ -246,17 +247,30 @@ Bi-LSTM xu ly chuoi thoi gian theo ca hai chieu (xuoi va nguoc). Chieu xuoi giup
 | Method | Endpoint | Mo ta |
 |--------|----------|-------|
 | `POST` | `/predict` | Du bao muc nuoc t+1/3/7/14/30d + khoang tin cay 95% |
+| `GET` | `/forecast?date=YYYY-MM-DD` | Du bao tu dong tu dataset (khong can nhap lieu) |
+| `POST` | `/forecast-realtime` | Du bao tuong lai — bam 1 nut, server tu doc du lieu |
 | `GET` | `/health` | Trang thai server + cac model da tai |
-| `GET` | `/features` | Danh sach 26 features theo dung thu tu |
+| `GET` | `/features` | Danh sach 19 features theo dung thu tu |
 | `GET` | `/thresholds` | Nguong canh bao lu ho Nui Coc |
+| `GET` | `/` | Dashboard HTML tuong tac (bieu do + canh bao) |
 
 ### Vi du goi API
 
 ```bash
+# Du bao tu dong tu dataset (don gian nhat)
+curl "http://localhost:8000/forecast?date=2024-09-10"
+
+# Du bao tuong lai (1 nut)
+curl -X POST "http://localhost:8000/forecast-realtime" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Du bao voi dac trung tu cung cap
 curl -X POST "http://localhost:8000/predict" \
   -H "Content-Type: application/json" \
   -d '{
-    "features": [[0.0]*26]*60,
+    "features": [[0.0, 0.0, ...] for 19 features] * 21 rows,
+    "base_level_m": 42.5,
     "timestamp": "2026-06-01T00:00:00+07:00"
   }'
 ```
