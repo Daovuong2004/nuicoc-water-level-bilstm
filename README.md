@@ -229,7 +229,7 @@ Dense(1, activation='linear')   ← Du bao ΔH (scaled)
 ```
 
 **Ly do dung Bi-LSTM trong thuy van:**
-Bi-LSTM xu ly chuoi thoi gian theo ca hai chieu (xuoi va nguoc). Chieu xuoi giup hoc xu huong tich luy mua va tang muc nuoc. Chieu nguoc giup nam bat cac quy luat chu ky mua kho. Ket qua ablation study: Bi-LSTM (RMSE=0.374m, NSE=0.988) vuot troi LSTM don huong (RMSE=0.482m, NSE=0.981) va GRU (RMSE=0.480m, NSE=0.981) tai t+1d.
+Bi-LSTM xu ly chuoi thoi gian theo ca hai chieu (xuoi va nguoc). Chieu xuoi giup hoc xu huong tich luy mua va tang muc nuoc. Chieu nguoc giup nam bat cac quy luat chu ky mua kho. Ket qua ablation study: Bi-LSTM (RMSE=0.343m, NSE=0.990) vuot troi LSTM don huong (RMSE=0.493m, NSE=0.980) va GRU (RMSE=0.477m, NSE=0.981) tai t+1d.
 
 **Tham so huan luyen:**
 | Tham so | Gia tri |
@@ -301,11 +301,11 @@ Danh gia theo tieu chuan thuy van quoc te (Moriasi et al., 2007 & WMO):
 
 | Horizon | RMSE (m) | MAE (m) | NSE | PBIAS (%) | Danh gia |
 |---------|---------|--------|-----|----------|----------|
-| **t+1d** | 0.358 | 0.219 | **0.989** | 0.032 | ✅ Xuat sac |
-| **t+3d** | 0.965 | 0.570 | **0.922** | 0.093 | ✅ Tot |
-| **t+7d** | 2.061 | 1.205 | 0.643 | 0.443 | 🟡 Kha |
-| t+14d | 3.147 | 2.388 | 0.163 | 0.308 | 🔴 Yeu |
-| t+30d | 4.556 | 3.893 | -0.702 | 3.618 | 🔴 Rat yeu |
+| **t+1d** | 0.343 | 0.184 | **0.990** | 0.041 | ✅ Xuat sac |
+| **t+3d** | 1.006 | 0.616 | **0.915** | 0.257 | ✅ Tot |
+| **t+7d** | 2.003 | 1.148 | 0.663 | -0.224 | 🟡 Kha |
+| t+14d | 3.378 | 2.484 | 0.037 | -0.046 | 🔴 Yeu |
+| t+30d | 4.126 | 3.231 | -0.396 | 1.064 | 🔴 Rat yeu |
 
 ---
 
