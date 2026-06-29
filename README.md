@@ -87,55 +87,144 @@ DATN/
 
 ---
 
-## Cai dat & Chay
+## Cài đặt & Chạy
 
-### 1. Yeu cau he thong
-- Python 3.10+
-- RAM >= 8GB (de huan luyen BiLSTM)
-- GPU (tuy chon, TensorFlow tu dong dung GPU neu co)
-- Tai khoan Google Earth Engine (cho buoc 2 tren Colab)
+### Yêu cầu hệ thống
 
-### 2. Cai thu vien
+| Thành phần | Phiên bản / Yêu cầu |
+|---|---|
+| **Python** | 3.10 hoặc mới hơn |
+| **RAM** | ≥ 8 GB (để huấn luyện BiLSTM) |
+| **GPU** | Tùy chọn — TensorFlow tự động dùng CUDA nếu có |
+| **Tài khoản GEE** | Chỉ cần cho Bước 2 (chạy trên Google Colab) |
+
+---
+
+### Bước 1 — Clone repository
 
 ```bash
+git clone https://github.com/Daovuong2004/nuicoc-water-level-bilstm.git
+cd nuicoc-water-level-bilstm
+```
+
+---
+
+### Bước 2 — Tạo môi trường ảo (khuyến nghị)
+
+**Linux / macOS**
+```bash
+python3.10 -m venv env
+source env/bin/activate
+```
+
+**Windows (PowerShell)**
+```powershell
+python -m venv env
+.\env\Scripts\Activate.ps1
+```
+
+> **Lưu ý:** Nếu gặp lỗi `cannot be loaded because running scripts is disabled`, chạy lệnh sau trước:
+> ```powershell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+
+---
+
+### Bước 3 — Cài đặt thư viện
+
+```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Cac thu vien chinh can cai:
-- `tensorflow>=2.13`, `keras>=3.0`
-- `fastapi>=0.110`, `uvicorn[standard]>=0.29`, `pydantic>=2.0`
-- `scikit-learn`, `pandas`, `numpy`, `scipy`, `joblib`
-- `shap>=0.44`, `statsmodels>=0.14`, `matplotlib`, `seaborn`
+Các thư viện chính:
 
-### 3. Chay pipeline day du
+| Nhóm | Thư viện |
+|---|---|
+| Deep Learning | `tensorflow>=2.13`, `keras>=3.0` |
+| API Serving | `fastapi>=0.110`, `uvicorn[standard]>=0.29`, `pydantic>=2.0` |
+| ML / Data | `scikit-learn`, `pandas>=2.0`, `numpy`, `scipy`, `joblib` |
+| Explainability | `shap>=0.44` |
+| Visualization | `matplotlib`, `seaborn` |
+| Time series | `statsmodels>=0.14` |
+
+> **GPU (tùy chọn):** Nếu muốn dùng GPU, cài thêm driver CUDA phù hợp. TensorFlow ≥ 2.13 hỗ trợ CUDA 11.8 / cuDNN 8.6.
+
+---
+
+### Bước 4 — Chuẩn bị dữ liệu
+
+> **Quan trọng:** Thư mục `data/` và `models/` bị gitignore — bạn cần tự tạo trước khi chạy.
 
 ```bash
-# Option A: Chay tat ca cac buoc tu dong
-python run_all.py
-
-# Option B: Chay tung buoc
-python 01_nasa_power.py          # Thu thap khi tuong
-# Buoc 2: Chay 02_gee_colab.py tren Google Colab
-python 03_04_cua_xa_bao_chi.py   # Xu ly bao chi
-python 05_integrate.py           # Tich hop du lieu
-python 06_bilstm_model.py        # Huan luyen Bi-LSTM
-python 06b_baseline_comparison.py # Ablation study (tuy chon)
+# Tạo thư mục cần thiết
+mkdir -p data/raw data/processed data/final models results
 ```
 
-### 4. Khoi dong API Server
+**Thu thập dữ liệu thô:**
+```bash
+# Bước 1: Tải dữ liệu khí tượng NASA POWER (tự động)
+python 01_nasa_power.py
+
+# Bước 2: Trích xuất ảnh vệ tinh Sentinel-2 trên Google Colab
+#   → Mở file 02_gee_colab.py và chạy trên Google Colab
+#   → Tải kết quả về và lưu vào data/raw/
+
+# Bước 3+4: Xử lý cửa xả & sự kiện lũ từ báo chí
+python 03_04_cua_xa_bao_chi.py
+```
+
+---
+
+### Bước 5 — Chạy pipeline đầy đủ
+
+**Option A — Chạy tự động toàn bộ pipeline:**
+```bash
+python run_all.py
+```
+
+**Option B — Chạy từng bước:**
+```bash
+python 05_integrate.py            # Tích hợp dữ liệu + Kalman + Q_out
+python 06_bilstm_model.py         # Huấn luyện Bi-LSTM + SHAP
+python 06b_baseline_comparison.py # Ablation study SARIMA/LSTM/GRU (tùy chọn)
+```
+
+Kết quả huấn luyện sẽ được lưu vào:
+```
+models/   → bilstm_t1d.keras, bilstm_t3d.keras, ..., feature_scaler_daily.pkl
+results/  → plot_t*d.png, shap_importance_*.png, metrics_summary.json
+```
+
+---
+
+### Bước 6 — Khởi động API Server
 
 ```bash
-# Su dung uvicorn (khuyen nghi)
+# Khuyến nghị: dùng uvicorn với auto-reload (development)
 uvicorn 08_api_serve:app --reload --host 0.0.0.0 --port 8000
 
-# Hoac chay truc tiep
+# Hoặc chạy trực tiếp
 python 08_api_serve.py
 ```
 
-Sau khi khoi dong, truy cap:
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
-- **Health check**: http://localhost:8000/health
+Sau khi khởi động, truy cập:
+
+| Đường dẫn | Mô tả |
+|---|---|
+| http://localhost:8000 | Dashboard HTML tương tác |
+| http://localhost:8000/docs | Swagger UI — thử API trực tiếp |
+| http://localhost:8000/redoc | ReDoc — tài liệu API |
+| http://localhost:8000/health | Kiểm tra trạng thái server |
+
+---
+
+### Mã hóa Unicode trên Windows
+
+Nếu gặp lỗi encoding khi chạy trên Windows:
+```powershell
+$env:PYTHONIOENCODING="utf-8"; python run_all.py
+```
 
 ---
 
